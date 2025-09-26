@@ -1,3 +1,4 @@
 hailo_compatible_models/*/*.onnx
 hailo_reference_models/*/*.onnx
 venv
+TODOs.md
