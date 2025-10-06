@@ -15,8 +15,49 @@ Run inference and compare results of both models (our converted and Hailo refere
 import numpy as np
 import onnxruntime as ort
 import librosa
-import os
+import time
 from transformers import WhisperProcessor, WhisperTokenizer
+
+
+# Repetition penalty: 1.0 = no penalty, 1.2 = mild, 1.5 = strong
+# Helps prevent hallucination loops when padding is insufficient
+REPETITION_PENALTY = 1.0  # Set to 1.2 if you see repetitions
+
+# EOS boosting: If EOS token is within this threshold of top token, choose EOS
+# 0.0 = disabled, 0.5 = aggressive, 1.0 = very aggressive
+EOS_BOOST_THRESHOLD = 0.0
+
+# ORIG_MAX_LEN = 1500
+ORIG_MAX_LEN = 1500
+
+# Debug output: Show detailed penalty/boost decisions
+DEBUG_OUTPUT = False  # Set to True to see per-token decisions
+
+
+# Option 1 (Minimal padding + EOS boost):
+# ORIG_MAX_LEN = 500          # No padding (minimal compute)
+# REPETITION_PENALTY = 1.01   # Very mild
+# EOS_BOOST_THRESHOLD = 0.5   # Aggressive EOS preference
+# - Lowest compute overhead
+# - Relies on EOS boosting to stop correctly
+# 4.58x speedup 
+#    Total time: 37.0ms
+#    Avg time per token: 2.4ms
+#    Decoded text: ' Hello world.'
+
+# Option 2 (Moderate padding + mild penalty):
+# ORIG_MAX_LEN = 600-650      # Some padding
+# REPETITION_PENALTY = 1.1    # Mild penalty
+# EOS_BOOST_THRESHOLD = 0.3   # Moderate EOS preference
+# - Balanced approach
+# - Multiple safety nets
+
+# Option 3 (Safe padding, minimal intervention):
+# ORIG_MAX_LEN = 700+         # Sufficient padding
+# REPETITION_PENALTY = 1.0    # No penalty needed
+# EOS_BOOST_THRESHOLD = 0.0   # Disabled
+# - Most reliable
+# - Higher compute (but still 2x better than padding to 1500)
 
 def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio="samples/hello_world.wav"):
     """Complete side-by-side inference comparison"""
@@ -98,154 +139,336 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
 
 
     # ========================================
-    # DECODER COMPARISON
+    # AUTOREGRESSIVE DECODING TEST (NPU SIMULATION)
     # ========================================
-    print(f"\n🗣️  DECODER COMPARISON")
+    print(f"\n🔁 AUTOREGRESSIVE DECODING TEST (NPU Simulation)")
     print("=" * 30)
+    print("Testing: True token-by-token autoregressive generation")
+    print("NOTE: This simulates Hailo NPU decoder behavior with full 528x overhead:")
+    print("  - 32x: Processes all 32 positions when only 1 prediction needed")
+    print("  - 16.5x: No KV cache, recomputes attention for all previous tokens")
+    print("  - This matches Hailo's fixed-shape ONNX requirements")
 
-    # Standard Whisper task tokens for English transcription
-    forced_decoder_ids = [
-        50258,  # <|startoftranscript|>
-        50259,  # <|en|>
-        50359,  # <|transcribe|>
-        50363   # <|notimestamps|>
-    ]
+    max_new_tokens = 28  # Generate up to 28 new tokens (total 32 with forced)
 
-    decoder_input_ids = np.array([forced_decoder_ids + [50257] * (32 - len(forced_decoder_ids))], dtype=np.int64)
+    def autoregressive_decode(dec_session, encoder_hidden_states, max_new_tokens):
+        """Generate tokens one at a time autoregressively"""
+        # Start with forced tokens
+        generated_tokens = [50258, 50259, 50359, 50363]  # <|startoftranscript|>, <|en|>, <|transcribe|>, <|notimestamps|>
+        token_times = []  # Track time for each token generation
 
-    # Prepare inputs for our decoder
-    our_dec_inputs = {
-        "decoder_input_ids": decoder_input_ids,
-        "encoder_hidden_states": our_enc_output
-    }
+        for _ in range(max_new_tokens):
+            # Pad current tokens to sequence length 32
+            current_length = len(generated_tokens)
+            padded_tokens = generated_tokens + [50257] * (32 - current_length)
+            decoder_input = np.array([padded_tokens], dtype=np.int64)
 
-    # Prepare inputs for reference decoder
-    ref_dec_inputs = {
-        "decoder_input_ids": decoder_input_ids,
-        "encoder_hidden_states": ref_enc_output
-    }
+            # Run decoder
+            dec_inputs = {
+                "decoder_input_ids": decoder_input,
+                "encoder_hidden_states": encoder_hidden_states
+            }
+            token_start = time.time()
+            logits = dec_session.run(None, dec_inputs)[0]
+            token_time = time.time() - token_start
 
-    # Run both decoders
-    our_dec_output = our_dec_session.run(None, our_dec_inputs)[0]
-    ref_dec_output = ref_dec_session.run(None, ref_dec_inputs)[0]
+            # Get prediction for the next token (at position current_length)
+            next_token_logits = logits[0, current_length, :]
+            next_token = np.argmax(next_token_logits)
 
-    print(f"✅ Both decoders completed successfully")
-    print(f"   Our decoder output: {our_dec_output.shape}")
-    print(f"   Ref decoder output: {ref_dec_output.shape}")
-
-    # Compare decoder outputs
-    assert our_dec_output.shape == ref_dec_output.shape
-    abs_diff = np.abs(our_dec_output - ref_dec_output)
-    max_diff = np.max(abs_diff)
-    mean_diff = np.mean(abs_diff)
-
-    print(f"\n📊 Decoder Logits Comparison:")
-    print(f"   Max absolute difference:  {max_diff:.6f}")
-    print(f"   Mean absolute difference: {mean_diff:.6f}")
-    print(f"   Our decoder stats:  min={our_dec_output.min():.3f}, max={our_dec_output.max():.3f}, mean={our_dec_output.mean():.3f}")
-    print(f"   Ref decoder stats:  min={ref_dec_output.min():.3f}, max={ref_dec_output.max():.3f}, mean={ref_dec_output.mean():.3f}")
-
-    # Get predicted tokens
-    our_predicted = np.argmax(our_dec_output[0], axis=-1)
-    ref_predicted = np.argmax(ref_dec_output[0], axis=-1)
-
-    print(f"\n🔤 Token Predictions Comparison:")
-    print(f"   Our model tokens: {our_predicted[:12].tolist()}")
-    print(f"   Ref model tokens: {ref_predicted[:12].tolist()}")
-
-    # Check token agreement
-    token_matches = np.sum(our_predicted == ref_predicted)
-    total_tokens = len(our_predicted)
-    match_percentage = 100 * token_matches / total_tokens
-    print(f"   Token agreement: {token_matches}/{total_tokens} ({match_percentage:.1f}%)")
-
-    # Decode both predictions to text
-    print(f"\n📝 Decoded Text Comparison:")
-
-    for model_name, predicted_ids in [("Our Model", our_predicted), ("Ref Model", ref_predicted)]:
-        meaningful_ids = []
-        for i, token_id in enumerate(predicted_ids):
-            if i < 4:  # Skip forced tokens
-                continue
-            if token_id == 50257 or token_id == 50256:  # Skip padding/end tokens
+            # Stop if we hit end token or padding token
+            if next_token == 50257 or next_token == 50256:
                 break
-            meaningful_ids.append(int(token_id))
 
-        if meaningful_ids:
-            try:
-                decoded = tokenizer.decode(meaningful_ids, skip_special_tokens=True)
-                print(f"   {model_name}: '{decoded}'")
-            except Exception as decode_e:
-                print(f"   {model_name}: Raw tokens {meaningful_ids} (decode failed: {decode_e})")
-        else:
-            print(f"   {model_name}: No meaningful tokens to decode")
+            generated_tokens.append(int(next_token))
+            token_times.append(token_time)
 
+        return generated_tokens, token_times
+
+    # Generate with our decoder
+    print(f"\n🤖 Our decoder autoregressive generation:")
+    start_time = time.time()
+    our_autoregressive_tokens, our_token_times = autoregressive_decode(our_dec_session, our_enc_output, max_new_tokens)
+    our_decode_time = time.time() - start_time
+    our_meaningful = our_autoregressive_tokens[4:]  # Skip forced tokens
+
+    # Print tokens with timing
+    print(f"   Generated tokens with timing (ms):")
+    for i, (token, token_time) in enumerate(zip(our_meaningful, our_token_times)):
+        token_text = tokenizer.decode([token], skip_special_tokens=True)
+        print(f"      [{i}] {token} '{token_text}' ({token_time*1000:.1f}ms)")
+
+    print(f"   Total time: {our_decode_time*1000:.1f}ms")
+    print(f"   Avg time per token: {np.mean(our_token_times)*1000:.1f}ms")
+    try:
+        our_autoregressive_text = tokenizer.decode(our_meaningful, skip_special_tokens=True)
+        print(f"   Decoded text: '{our_autoregressive_text}'")
+    except Exception as e:
+        print(f"   Decode failed: {e}")
+
+    # Generate with reference decoder
+    print(f"\n🤖 Reference decoder autoregressive generation:")
+    start_time = time.time()
+    ref_autoregressive_tokens, ref_token_times = autoregressive_decode(ref_dec_session, ref_enc_output, max_new_tokens)
+    ref_decode_time = time.time() - start_time
+    ref_meaningful = ref_autoregressive_tokens[4:]  # Skip forced tokens
+
+    # Print tokens with timing
+    print(f"   Generated tokens with timing (ms):")
+    for i, (token, token_time) in enumerate(zip(ref_meaningful, ref_token_times)):
+        token_text = tokenizer.decode([token], skip_special_tokens=True)
+        print(f"      [{i}] {token} '{token_text}' ({token_time*1000:.1f}ms)")
+
+    print(f"   Total time: {ref_decode_time*1000:.1f}ms")
+    print(f"   Avg time per token: {np.mean(ref_token_times)*1000:.1f}ms")
+    try:
+        ref_autoregressive_text = tokenizer.decode(ref_meaningful, skip_special_tokens=True)
+        print(f"   Decoded text: '{ref_autoregressive_text}'")
+    except Exception as e:
+        print(f"   Decode failed: {e}")
+
+    # Compare autoregressive results
+    print(f"\n📊 Autoregressive Comparison:")
+    min_length = min(len(our_autoregressive_tokens), len(ref_autoregressive_tokens))
+    matches = sum(1 for i in range(min_length) if our_autoregressive_tokens[i] == ref_autoregressive_tokens[i])
+    print(f"   Token agreement: {matches}/{min_length} ({100*matches/min_length:.1f}%)")
+    print(f"   Our model generated: {len(our_autoregressive_tokens)} total tokens")
+    print(f"   Ref model generated: {len(ref_autoregressive_tokens)} total tokens")
 
 
     # ========================================
-    # CROSS-COMPARISON TEST
+    # EFFICIENT CACHED DECODING TEST (HYBRID ARCHITECTURE)
     # ========================================
-    print(f"\n🔄 CROSS-COMPARISON TEST")
+    print(f"\n⚡ EFFICIENT CACHED DECODING TEST (Hybrid: Encoder on NPU, Decoder with KV Cache)")
     print("=" * 30)
-    print("Testing: Reference encoder output → Our decoder vs Ref decoder (to understand whether decoder leads to same results)")
+    print("Testing: Encoder on NPU (Hailo) + Efficient decoder with KV cache")
+    print("NOTE: This is the RECOMMENDED production architecture:")
+    print("  - ✅ Encoder uses NPU (fast, fixed shape - perfect for Hailo)")
+    print("  - ✅ Decoder uses KV cache (eliminates 16.5x overhead)")
+    print("  - ✅ Only 1 token processed per step (eliminates 32x overhead)")
 
-    # Use reference encoder output with our decoder
-    cross_dec_inputs = {
-        "decoder_input_ids": decoder_input_ids,
-        "encoder_hidden_states": ref_enc_output  # Reference encoder, our decoder
-    }
+    # Load efficient decoder models with KV cache support
+    decoder_init_path = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_model.onnx"
+    decoder_with_past_path = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_with_past_model.onnx"
 
-    cross_dec_output = our_dec_session.run(None, cross_dec_inputs)[0]
-    cross_predicted = np.argmax(cross_dec_output[0], axis=-1)
+    decoder_init_session = ort.InferenceSession(decoder_init_path)
+    decoder_with_past_session = ort.InferenceSession(decoder_with_past_path)
 
-    print(f"   Cross-test tokens:     {cross_predicted[:12].tolist()}")
-    print(f"   Original ref tokens:   {ref_predicted[:12].tolist()}")
+    print(f"\n📦 Loaded efficient decoder models:")
+    print(f"   Init decoder: {decoder_init_path.split('/')[-1]}")
+    print(f"   Cached decoder: {decoder_with_past_path.split('/')[-1]}")
 
-    # Check if using ref encoder output gives same result as ref decoder
-    cross_ref_matches = np.sum(cross_predicted == ref_predicted)
-    cross_match_percentage = 100 * cross_ref_matches / total_tokens
-    print(f"   Agreement with ref decoder: {cross_ref_matches}/{total_tokens} ({cross_match_percentage:.1f}%)")
+    def efficient_autoregressive_decode(decoder_init_session, decoder_with_past_session, encoder_hidden_states, max_new_tokens, repetition_penalty=1.0, eos_boost_threshold=0.0, debug_output=False, tokenizer=None):
+        """Generate tokens efficiently using KV cache
 
-    # Compare with our original decoder output
-    cross_our_matches = np.sum(cross_predicted == our_predicted)
-    cross_our_percentage = 100 * cross_our_matches / total_tokens
-    print(f"   Agreement with our decoder: {cross_our_matches}/{total_tokens} ({cross_our_percentage:.1f}%)")
+        Args:
+            repetition_penalty: Value > 1.0 penalizes repeated tokens.
+                                1.0 = no penalty, 1.2 = mild penalty, 1.5 = strong penalty
+            eos_boost_threshold: If EOS score is within this threshold of top score, pick EOS.
+                                0.0 = disabled, 0.5 = aggressive, 1.0 = very aggressive
+            debug_output: If True, print detailed penalty/boost decisions (slows down timing)
+            tokenizer: WhisperTokenizer for decoding token IDs to text (for debug output)
+        """
+        # Start with forced tokens
+        forced_tokens = [50258, 50259, 50359, 50363]
+        generated_tokens = forced_tokens.copy()
+        token_times = []  # Track time for each token generation
 
-    # Decode cross-test result
-    cross_meaningful_ids = []
-    for i, token_id in enumerate(cross_predicted):
-        if i < 4:  # Skip forced tokens
-            continue
-        if token_id == 50257 or token_id == 50256:  # Skip padding/end tokens
-            break
-        cross_meaningful_ids.append(int(token_id))
+        # Get output names for both sessions
+        decoder_outputs = [out.name for out in decoder_init_session.get_outputs()]
+        decoder_with_past_outputs = [out.name for out in decoder_with_past_session.get_outputs()]
 
-    if cross_meaningful_ids:
-        try:
-            cross_decoded = tokenizer.decode(cross_meaningful_ids, skip_special_tokens=True)
-            print(f"   Cross-test decoded: '{cross_decoded}'")
-        except Exception as decode_e:
-            print(f"   Cross-test: Raw tokens {cross_meaningful_ids} (decode failed: {decode_e})")
-    else:
-        print(f"   Cross-test: No meaningful tokens to decode")
+        past_key_values_dict = {}
 
-    # Analysis
-    print(f"\n📊 Cross-Test Analysis:")
-    if cross_match_percentage > 90:
-        print("   🎯 HIGH AGREEMENT: Decoders behave very similarly")
-    else:
-        print("   ❌ LOW AGREEMENT: Significant decoder differences")
+        # Account for initial tokens in max_length calculation
+        for _ in range(max_new_tokens):
+            token_start = time.time()
+
+            if not past_key_values_dict:
+                # First pass: process all forced tokens at once and initialize cache
+                input_ids = np.array([forced_tokens], dtype=np.int64)
+
+                inputs = {
+                    'input_ids': input_ids,
+                    'encoder_hidden_states': encoder_hidden_states
+                }
+
+                outputs = decoder_init_session.run(None, inputs)
+                logits = outputs[0]
+
+                # Store past key values (both decoder and encoder cache)
+                for idx, output_name in enumerate(decoder_outputs[1:], 1):
+                    if "present" in output_name:
+                        past_name = output_name.replace("present.", "past_key_values.")
+                        past_key_values_dict[past_name] = outputs[idx]
+            else:
+                # Subsequent passes: use cached decoder (only process 1 new token at a time)
+                # Process only the last token
+                current_input_ids = np.array([[generated_tokens[-1]]], dtype=np.int64)
+
+                inputs = {'input_ids': current_input_ids}
+                inputs.update(past_key_values_dict)
+
+                outputs = decoder_with_past_session.run(None, inputs)
+                logits = outputs[0]
+
+                # Update past key values (only decoder cache changes, encoder cache stays same)
+                for idx, output_name in enumerate(decoder_with_past_outputs[1:], 1):
+                    if "present" in output_name:
+                        past_name = output_name.replace("present.", "past_key_values.")
+                        past_key_values_dict[past_name] = outputs[idx]
+
+            token_time = time.time() - token_start
+
+            # Get next token logits
+            next_token_logits = logits[0, -1, :].copy()
+            original_logits = next_token_logits.copy()
+
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                # Get unique tokens from generated sequence (excluding forced tokens)
+                tokens_to_penalize = set(generated_tokens[len(forced_tokens):])
+
+                # Debug: show top candidates before penalty
+                top_5_indices = np.argsort(original_logits)[-5:][::-1]
+
+                for token_id in tokens_to_penalize:
+                    if next_token_logits[token_id] > 0:
+                        next_token_logits[token_id] /= repetition_penalty
+                    else:
+                        next_token_logits[token_id] *= repetition_penalty
+
+                if debug_output:
+                    # Debug: show top candidates after penalty
+                    top_5_indices_after = np.argsort(next_token_logits)[-5:][::-1]
+
+                    # Print comparison for this step
+                    print(f"\n      [Debug] Step {len(generated_tokens) - len(forced_tokens)}: Repetition penalty applied")
+                    print(f"      Top 5 BEFORE penalty:")
+                    for idx in top_5_indices:
+                        penalized_mark = "(*)" if idx in tokens_to_penalize else ""
+                        token_text = f"'{tokenizer.decode([idx])}'" if tokenizer else ""
+                        print(f"        Token {idx} {token_text}: {original_logits[idx]:.3f} {penalized_mark}")
+                    print(f"      Top 5 AFTER penalty:")
+                    for idx in top_5_indices_after:
+                        was_penalized = "(*)" if idx in tokens_to_penalize else ""
+                        score_change = f"({original_logits[idx]:.3f} → {next_token_logits[idx]:.3f})" if idx in tokens_to_penalize else ""
+                        token_text = f"'{tokenizer.decode([idx])}'" if tokenizer else ""
+                        print(f"        Token {idx} {token_text}: {next_token_logits[idx]:.3f} {was_penalized} {score_change}")
+
+            # Greedy decoding with optional EOS boosting
+            if eos_boost_threshold > 0.0:
+                top_score = np.max(next_token_logits)
+                eos_score = next_token_logits[50257]
+                score_diff = top_score - eos_score
+
+                if score_diff < eos_boost_threshold:
+                    # EOS is competitive, force it to prevent hallucination
+                    if debug_output and tokenizer:
+                        print(f"      [EOS Boost] Top: {top_score:.3f}, EOS: {eos_score:.3f}, diff: {score_diff:.3f} < {eos_boost_threshold} → Choosing EOS")
+                    next_token = 50257
+                else:
+                    next_token = np.argmax(next_token_logits)
+            else:
+                next_token = np.argmax(next_token_logits)
+
+            # Stop if we hit end token (50257), padding token (50256), or EOS token (50256/50257)
+            # Also check for <|endoftext|> token (50256)
+            if next_token in [50256, 50257]:  # EOS or padding
+                break
+
+            generated_tokens.append(int(next_token))
+            token_times.append(token_time)
+
+        return generated_tokens, token_times
+
+    # Generate with efficient cached decoder using our encoder output
+    print(f"\n🚀 Efficient cached generation (our encoder + cached decoder):")
+
+    # EXPERIMENTAL: Pad encoder output from 500 to 1500 to match standard decoder expectations
+    print(f"   NOTE: Padding encoder output from {our_enc_output.shape} to [1, 1500, 384]")
+
+    padded_encoder_output = np.pad(
+        our_enc_output,
+        ((0, 0), (0, ORIG_MAX_LEN - our_enc_output.shape[1]), (0, 0)),
+        mode='constant',
+        constant_values=0.0
+    )
+    print(f"   Padded shape: {padded_encoder_output.shape}")
+
+
+    start_time = time.time()
+    efficient_tokens, efficient_token_times = efficient_autoregressive_decode(
+        decoder_init_session, decoder_with_past_session, padded_encoder_output, max_new_tokens,
+        repetition_penalty=REPETITION_PENALTY,
+        eos_boost_threshold=EOS_BOOST_THRESHOLD,
+        debug_output=DEBUG_OUTPUT,
+        tokenizer=tokenizer
+    )
+    efficient_decode_time = time.time() - start_time
+    efficient_meaningful = efficient_tokens[4:]  # Skip forced tokens
+
+    # Print tokens with timing
+    print(f"   Generated tokens with timing (ms):")
+    for i, (token, token_time) in enumerate(zip(efficient_meaningful, efficient_token_times)):
+        token_text = tokenizer.decode([token], skip_special_tokens=True)
+        print(f"      [{i}] {token} '{token_text}' ({token_time*1000:.1f}ms)")
+
+    print(f"   Total time: {efficient_decode_time*1000:.1f}ms")
+    print(f"   Avg time per token: {np.mean(efficient_token_times)*1000:.1f}ms")
+    try:
+        efficient_text = tokenizer.decode(efficient_meaningful, skip_special_tokens=True)
+        print(f"   Decoded text: '{efficient_text}'")
+    except Exception as e:
+        print(f"   Decode failed: {e}")
+
+    # Compare with NPU simulation results
+    print(f"\n📊 Efficiency Comparison:")
+    print(f"   NPU simulation:")
+    print(f"      Generated: {len(our_autoregressive_tokens)} tokens")
+    print(f"      Time: {our_decode_time*1000:.1f}ms")
+    print(f"      Time per token: {our_decode_time*1000/len(our_meaningful) if our_meaningful else 0:.1f}ms")
+    print(f"   Efficient cached:")
+    print(f"      Generated: {len(efficient_tokens)} tokens")
+    print(f"      Time: {efficient_decode_time*1000:.1f}ms")
+    print(f"      Time per token: {efficient_decode_time*1000/len(efficient_meaningful) if efficient_meaningful else 0:.1f}ms")
+
+    # Calculate speedup
+    if efficient_decode_time > 0:
+        speedup = our_decode_time / efficient_decode_time
+        print(f"\n   ⚡ Speedup: {speedup:.2f}x faster with KV cache")
+        print(f"      (Efficient cached is {speedup:.2f}x faster than NPU simulation)")
+
+    # Compare token sequences
+    min_len = min(len(our_autoregressive_tokens), len(efficient_tokens))
+    token_matches = sum(1 for i in range(min_len) if our_autoregressive_tokens[i] == efficient_tokens[i])
+    print(f"\n   Token agreement: {token_matches}/{min_len} ({100*token_matches/min_len:.1f}%)")
+
+    # # Compare decoded text
+    # if 'our_autoregressive_text' in locals() and 'efficient_text' in locals():
+    #     if our_autoregressive_text == efficient_text:
+    #         print(f"   ✅ Decoded text IDENTICAL")
+    #     else:
+    #         print(f"   ⚠️  Decoded text differs:")
+    #         print(f"      NPU: '{our_autoregressive_text}'")
+    #         print(f"      Efficient: '{efficient_text}'")
+
 
 
 def main():
 
-    new_encoder_onnx_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
-    new_decoder_onnx_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_decoder_10s_hailo_final.onnx"
-    reference_encoder_onnx_path = "hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
-    reference_decoder_onnx_path = "hailo_reference_models/tiny/tiny-whisper-decoder-10s-seq-32.onnx"
+    new_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+    # new_decoder_onnx_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_decoder_10s_hailo_final.onnx"
+    default_whisper_decoder = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_model.onnx"
+    reference_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
+    reference_decoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_reference_models/tiny/tiny-whisper-decoder-10s-seq-32.onnx"
 
-    test_audio="samples/jfk_asknot.wav"
-    validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
+    # test_audio="samples/jfk_asknot.wav"
+    test_audio="samples/hello_world.wav"
+    # test_audio="samples/172.mp3"
+    # test_audio="samples/287.mp3"
+    validate_model(new_encoder_onnx_path, reference_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
+    # validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
 
 
 if __name__ == "__main__":
