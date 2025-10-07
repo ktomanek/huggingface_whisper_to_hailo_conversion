@@ -31,26 +31,26 @@ import preprocessing  # Hailo's efficient mel computation
 
 # Choose one of three configurations:
 
-# # Option 1: Conservative (Most Reliable)
-# # - Full padding to match training distribution
-# # - No additional interventions needed
-# ORIG_MAX_LEN = 1500           # Full padding
-# REPETITION_PENALTY = 1.0      # Disabled
-# EOS_BOOST_THRESHOLD = 0.0     # Disabled
+# Option 1: Conservative (Most Reliable) - DEFAULT
+# - Full padding to match training distribution
+# - No additional interventions needed
+ORIG_MAX_LEN = 1500           # Full padding
+REPETITION_PENALTY = 1.0      # Disabled
+EOS_BOOST_THRESHOLD = 0.0     # Disabled
 
 # # Option 2: Balanced (Recommended)
 # # - Minimal safe padding with safety nets
 # # - Good trade-off between speed and reliability
-# ORIG_MAX_LEN = 700            # Minimal safe padding
-# REPETITION_PENALTY = 1.1      # Mild penalty
-# EOS_BOOST_THRESHOLD = 0.2     # Conservative boost
+# # ORIG_MAX_LEN = 700            # Minimal safe padding
+# # REPETITION_PENALTY = 1.1      # Mild penalty
+# # EOS_BOOST_THRESHOLD = 0.2     # Conservative boost
 
 # # Option 3: Aggressive (Maximum Speed)
 # # - No padding, rely on interventions
 # # - Lowest compute overhead
-# ORIG_MAX_LEN = 500            # No padding
-# REPETITION_PENALTY = 1.2      # Stronger penalty
-# EOS_BOOST_THRESHOLD = 0.5     # Aggressive boost
+# # ORIG_MAX_LEN = 500            # No padding
+# # REPETITION_PENALTY = 1.2      # Stronger penalty
+# # EOS_BOOST_THRESHOLD = 0.5     # Aggressive boost
 
 DEBUG_OUTPUT = False          # Toggle detailed debug output
 MAX_NEW_TOKENS = 28           # 32 total - 4 forced tokens
@@ -59,7 +59,13 @@ MAX_NEW_TOKENS = 28           # 32 total - 4 forced tokens
 # MODEL PATHS
 # =============================================================================
 
-ENCODER_PATH = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+# 10s encoder (Hailo-optimized)
+ENCODER_10S_PATH = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+
+# 30s encoder (standard ONNX)
+ENCODER_30S_PATH = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/encoder_model.onnx"
+
+# Decoders (shared by both encoders)
 DECODER_INIT_PATH = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_model.onnx"
 DECODER_CACHED_PATH = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_with_past_model.onnx"
 
@@ -200,22 +206,26 @@ def get_whisper_processor():
     return _cached_processor
 
 
-def preprocess_huggingface(audio_path):
+def preprocess_huggingface(audio_path, target_duration=10):
     """
     HuggingFace preprocessing approach using WhisperProcessor.
 
+    Args:
+        audio_path: Path to audio file
+        target_duration: Target duration in seconds (10 or 30)
+
     Returns:
-        mel_input: Numpy array [1, 80, 1, 1000]
+        mel_input: Numpy array [1, 80, 1, N] where N=1000 for 10s, 3000 for 30s
     """
     # Load audio using librosa (HuggingFace default)
     audio = librosa.load(audio_path, sr=16000, mono=True)[0]
 
     # Check duration and crop if necessary
-    target_length = 16000 * 10  # 10 seconds at 16kHz
+    target_length = 16000 * target_duration
     audio_duration = len(audio) / 16000
 
     if len(audio) > target_length:
-        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to 10s")
+        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to {target_duration}s")
         audio = audio[:target_length]
     else:
         audio = np.pad(audio, (0, target_length - len(audio)), mode='constant')
@@ -225,10 +235,16 @@ def preprocess_huggingface(audio_path):
     inputs = processor(audio, sampling_rate=16000, return_tensors="np")
     mel_input = inputs.input_features  # [1, 80, 3000]
 
-    # Reshape to match encoder input: [1, 80, 1, 1000]
-    # Take first 1000 frames (10 seconds)
-    mel_input = mel_input[:, :, :1000]
-    mel_input = np.expand_dims(mel_input, axis=2)  # Add channel dimension
+    # Reshape based on target duration
+    if target_duration == 10:
+        # [1, 80, 1, 1000] for 10s encoder
+        mel_input = mel_input[:, :, :1000]
+        mel_input = np.expand_dims(mel_input, axis=2)
+    elif target_duration == 30:
+        # [1, 80, 3000] for 30s encoder (no reshape needed)
+        pass
+    else:
+        raise ValueError(f"Unsupported target_duration: {target_duration}")
 
     return mel_input
 
@@ -272,7 +288,7 @@ def preprocess_hailo(audio_path):
 # MAIN INFERENCE PIPELINE
 # =============================================================================
 
-def run_inference(audio_path, use_hailo_preprocessing=True):
+def run_inference(audio_path, use_hailo_preprocessing=True, encoder_path=None, encoder_duration=10):
     """
     Complete inference pipeline with timing breakdown.
 
@@ -280,6 +296,8 @@ def run_inference(audio_path, use_hailo_preprocessing=True):
         audio_path: Path to audio file
         use_hailo_preprocessing: If True, use Hailo's efficient preprocessing.
                                 If False, use HuggingFace preprocessing.
+        encoder_path: Path to encoder ONNX file (if None, uses 10s encoder)
+        encoder_duration: Expected duration of encoder input (10 or 30 seconds)
 
     Returns:
         transcription: Decoded text
@@ -287,13 +305,20 @@ def run_inference(audio_path, use_hailo_preprocessing=True):
     """
     timings = {}
 
+    # Default to 10s encoder if not specified
+    if encoder_path is None:
+        encoder_path = ENCODER_10S_PATH
+        encoder_duration = 10
+
     preprocessing_method = "Hailo" if use_hailo_preprocessing else "HuggingFace"
+    encoder_type = f"{encoder_duration}s encoder"
 
     print(f"\n{'='*70}")
     print("HAILO-OPTIMIZED WHISPER INFERENCE")
     print(f"{'='*70}")
     print(f"Configuration:")
     print(f"  Preprocessing method: {preprocessing_method}")
+    print(f"  Encoder: {encoder_type}")
     print(f"  Encoder output padding: {ORIG_MAX_LEN} positions")
     print(f"  Repetition penalty: {REPETITION_PENALTY}")
     print(f"  EOS boost threshold: {EOS_BOOST_THRESHOLD}")
@@ -309,7 +334,7 @@ def run_inference(audio_path, use_hailo_preprocessing=True):
     if use_hailo_preprocessing:
         mel_input = preprocess_hailo(audio_path)
     else:
-        mel_input = preprocess_huggingface(audio_path)
+        mel_input = preprocess_huggingface(audio_path, target_duration=encoder_duration)
 
     preprocess_time = (time.time() - preprocess_start) * 1000
     timings['preprocess'] = preprocess_time
@@ -319,16 +344,20 @@ def run_inference(audio_path, use_hailo_preprocessing=True):
     print()
 
     # -------------------------------------------------------------------------
-    # 2. ENCODER (10s model for Hailo)
+    # 2. ENCODER
     # -------------------------------------------------------------------------
-    print("📦 Stage 2: Encoder Inference")
+    print(f"📦 Stage 2: Encoder Inference ({encoder_duration}s)")
     encoder_start = time.time()
 
-    encoder_session = ort.InferenceSession(ENCODER_PATH)
-    encoder_output = encoder_session.run(None, {"x.1": mel_input})[0]
+    encoder_session = ort.InferenceSession(encoder_path)
+
+    # Get input name dynamically
+    encoder_input_name = encoder_session.get_inputs()[0].name
+    encoder_output = encoder_session.run(None, {encoder_input_name: mel_input})[0]
 
     encoder_time = (time.time() - encoder_start) * 1000
     timings['encoder'] = encoder_time
+    timings['encoder_duration'] = encoder_duration
 
     print(f"   ✅ Encoder output shape: {encoder_output.shape}")
     print(f"   ⏱️  Time: {encoder_time:.1f}ms")
@@ -435,14 +464,17 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use Hailo preprocessing (default, faster)
+  # Use Hailo preprocessing with 10s encoder (default, fastest)
   python hailo_inference_example.py audio.wav
 
   # Use HuggingFace preprocessing (for comparison)
   python hailo_inference_example.py audio.wav --preprocessing huggingface
 
-  # Compare both methods side by side
+  # Compare both preprocessing methods
   python hailo_inference_example.py audio.wav --compare
+
+  # Compare 10s vs 30s encoder performance
+  python hailo_inference_example.py audio.wav --compare-encoders
         """
     )
     parser.add_argument("audio_path", help="Path to audio file")
@@ -457,13 +489,87 @@ Examples:
         action="store_true",
         help="Run both preprocessing methods and compare timing"
     )
+    parser.add_argument(
+        "--compare-encoders",
+        action="store_true",
+        help="Compare 10s vs 30s encoder performance"
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.audio_path):
         print(f"❌ Error: Audio file not found: {args.audio_path}")
         sys.exit(1)
 
-    if args.compare:
+    if args.compare_encoders:
+        # Compare 10s vs 30s encoders
+        print("\n" + "="*70)
+        print("ENCODER COMPARISON: 10s vs 30s")
+        print("="*70)
+
+        # Warmup: load processors and mel filters
+        print("\n🔥 Warming up (loading processors and mel filters)...")
+        _ = get_whisper_processor()
+        _ = preprocess_hailo(args.audio_path)  # Load mel filters
+        _ = preprocess_huggingface(args.audio_path, target_duration=10)  # Warmup HF
+        print("   ✅ All preprocessors warmed up\n")
+
+        print("--- Running with 10s encoder (Hailo-optimized) ---")
+        trans_10s, timings_10s = run_inference(
+            args.audio_path,
+            use_hailo_preprocessing=True,
+            encoder_path=ENCODER_10S_PATH,
+            encoder_duration=10
+        )
+
+        print("\n--- Running with 30s encoder (standard ONNX) ---")
+        trans_30s, timings_30s = run_inference(
+            args.audio_path,
+            use_hailo_preprocessing=False,  # Use HF preprocessing for 30s
+            encoder_path=ENCODER_30S_PATH,
+            encoder_duration=30
+        )
+
+        # Comparison summary
+        print("\n" + "="*70)
+        print("ENCODER COMPARISON SUMMARY")
+        print("="*70)
+
+        print(f"\n10s Encoder:")
+        print(f"  Preprocessing: {timings_10s['preprocess']:.1f}ms")
+        print(f"  Encoder: {timings_10s['encoder']:.1f}ms")
+        print(f"  Decoder: {timings_10s['decoder_total']:.1f}ms")
+        print(f"  Total: {timings_10s['total']:.1f}ms")
+        print(f"  Transcription: '{trans_10s}'")
+
+        print(f"\n30s Encoder:")
+        print(f"  Preprocessing: {timings_30s['preprocess']:.1f}ms")
+        print(f"  Encoder: {timings_30s['encoder']:.1f}ms")
+        print(f"  Decoder: {timings_30s['decoder_total']:.1f}ms")
+        print(f"  Total: {timings_30s['total']:.1f}ms")
+        print(f"  Transcription: '{trans_30s}'")
+
+        encoder_speedup = timings_30s['encoder'] / timings_10s['encoder']
+        total_speedup = timings_30s['total'] / timings_10s['total']
+
+        print(f"\n⚡ Performance:")
+        print(f"   Encoder: 10s is {encoder_speedup:.2f}x faster ({timings_10s['encoder']:.1f}ms vs {timings_30s['encoder']:.1f}ms)")
+        print(f"   Overall: 10s pipeline is {total_speedup:.2f}x faster ({timings_10s['total']:.1f}ms vs {timings_30s['total']:.1f}ms)")
+
+        # Breakdown
+        encoder_savings = timings_30s['encoder'] - timings_10s['encoder']
+        total_savings = timings_30s['total'] - timings_10s['total']
+        print(f"\n💾 Savings:")
+        print(f"   Encoder time saved: {encoder_savings:.1f}ms")
+        print(f"   Total time saved: {total_savings:.1f}ms")
+
+        # Check transcriptions match
+        if trans_10s.strip().lower() == trans_30s.strip().lower():
+            print(f"\n✅ Both encoders produce equivalent transcriptions (ignoring case/punctuation)")
+        else:
+            print(f"\n⚠️  Transcriptions differ slightly")
+            print(f"   This is expected - 30s encoder may handle punctuation differently")
+
+    elif args.compare:
         # Run both methods and compare
         print("\n" + "="*70)
         print("PREPROCESSING COMPARISON")

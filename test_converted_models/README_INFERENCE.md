@@ -32,7 +32,7 @@ python hailo_inference_example.py audio.wav
 python hailo_inference_example.py audio.wav --preprocessing huggingface
 ```
 
-### Compare Both Methods
+### Compare Preprocessing Methods
 
 ```bash
 python hailo_inference_example.py audio.wav --compare
@@ -42,6 +42,17 @@ This will:
 1. Verify both methods produce identical mel spectrograms
 2. Run inference with both methods
 3. Show timing comparison
+
+### Compare 10s vs 30s Encoder
+
+```bash
+python hailo_inference_example.py audio.wav --compare-encoders
+```
+
+This will:
+1. Run inference with 10s encoder (Hailo-optimized)
+2. Run inference with 30s encoder (standard ONNX)
+3. Show detailed performance comparison
 
 ## Performance Comparison
 
@@ -90,11 +101,40 @@ Speedup: 2.37x
 - HuggingFace uses standard mel spectrogram computation (slower)
 - Both methods produce **identical** outputs (verified via assertion)
 
-**Timing breakdown with Hailo preprocessing:**
-- Preprocessing: ~45ms (34%)
-- Encoder: ~40ms (30%)
-- Decoder: ~50ms (38%)
-- **Total: ~135ms**
+### Encoder Comparison: 10s vs 30s
+
+**Example output (beckett.wav - 8 seconds):**
+
+```
+10s Encoder:
+  Preprocessing: 2.0ms
+  Encoder: 40.0ms
+  Decoder: 42.0ms
+  Total: 84.2ms
+
+30s Encoder:
+  Preprocessing: 4.7ms
+  Encoder: 97.1ms
+  Decoder: 32.6ms
+  Total: 134.5ms
+
+⚡ Performance:
+   Encoder: 10s is 2.43x faster (40.0ms vs 97.1ms)
+   Overall: 10s pipeline is 1.60x faster (84.2ms vs 134.5ms)
+
+💾 Savings:
+   Encoder time saved: 57.1ms
+   Total time saved: 50.3ms
+```
+
+**Key Insights:**
+- 10s encoder is **~2.4x faster** than 30s encoder
+- Overall pipeline **~1.6x faster** with 10s
+- Encoder accounts for **47% of total time** (10s) vs **72%** (30s)
+- Decoder padding overhead (+4.8ms) is negligible compared to encoder savings (57ms)
+
+**Recommendation:**
+Use 10s encoder with full padding (1500 positions) for optimal balance of speed and reliability.
 
 ## Configuration Options
 
