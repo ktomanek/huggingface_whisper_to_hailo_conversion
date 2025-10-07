@@ -6,6 +6,7 @@ Based on HailoWhisperPipeline from Hailo Application Code Examples
 import numpy as np
 import os
 import argparse
+import time
 from hailo_platform import (HEF, VDevice, HailoSchedulingAlgorithm, FormatType)
 from transformers import AutoTokenizer
 from queue import Queue, Empty
@@ -19,7 +20,7 @@ import torch
 # call
 
 # orig HEFs
-# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef   --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/jfk_asknot.wav
+# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef   --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/hello_world.wav
 #
 # my HEF for encoder
 # python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/my_converted/whisper_tiny_encoder_10s_hailo_final_optimized.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef   --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/jfk_asknot.wav
@@ -322,10 +323,14 @@ class HailoWhisperPipeline:
                             buffer = np.zeros(encoder_infer_model.output().shape).astype(np.float32)
                             encoder_bindings.output().set_buffer(buffer)
 
+                            # Time encoder inference
+                            encoder_start = time.time()
                             encoder_configured_infer_model.run([encoder_bindings], self.timeout_ms)
+                            encoder_time_ms = (time.time() - encoder_start) * 1000
                             encoded_features = encoder_bindings.output().get_buffer()
 
                             # Debug: Print encoder output info
+                            print(f"[TIMING] Encoder: {encoder_time_ms:.1f}ms")
                             print(f"[DEBUG] Encoder output shape: {encoded_features.shape}")
                             print(f"[DEBUG] Encoder output range: [{encoded_features.min():.3f}, {encoded_features.max():.3f}]")
                             print(f"[DEBUG] Encoder output mean: {encoded_features.mean():.3f}, std: {encoded_features.std():.3f}")
@@ -343,11 +348,14 @@ class HailoWhisperPipeline:
 
                             generated_tokens = []
                             decoder_outputs = None
+                            token_times = []
 
                             print(f"[DEBUG] Starting decoder with {self.decoding_sequence_length} max tokens")
 
                             # Run Decoder Iteratively
                             for i in range(self.decoding_sequence_length - 1):
+                                step_start = time.time()
+
                                 tokenized_ids = self._tokenization(decoder_input_ids)
 
                                 decoder_bindings.input(f"{decoder_model_name}/input_layer1").set_buffer(encoded_features)
@@ -372,10 +380,13 @@ class HailoWhisperPipeline:
                                 logits = apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=repetition_penalty)
                                 next_token = np.argmax(logits)
 
-                                # Debug: Show token generation
+                                step_time_ms = (time.time() - step_start) * 1000
+                                token_times.append(step_time_ms)
+
+                                # Debug: Show token generation with timing
                                 token_text = self.tokenizer.decode([next_token]) if next_token < len(self.tokenizer) else f"<{next_token}>"
                                 top_3_tokens = np.argsort(decoder_outputs[:, i].flatten())[-3:][::-1]
-                                print(f"[DEBUG] Step {i}: token={next_token} '{token_text}' | top-3: {top_3_tokens}")
+                                print(f"[TIMING] Step {i}: {step_time_ms:.1f}ms | token={next_token} '{token_text}' | top-3: {top_3_tokens}")
 
                                 generated_tokens.append(next_token)
                                 decoder_input_ids[0][i + 1] = np.array([[next_token]], dtype=np.int64)
@@ -388,6 +399,18 @@ class HailoWhisperPipeline:
                             transcription = self.tokenizer.decode(
                                 generated_tokens, skip_special_tokens=True
                             )
+
+                            # Print decoder timing summary
+                            if token_times:
+                                total_decoder_time = sum(token_times)
+                                avg_token_time = np.mean(token_times)
+                                print(f"\n[TIMING] Decoder Summary:")
+                                print(f"  Total tokens: {len(token_times)}")
+                                print(f"  Total time: {total_decoder_time:.1f}ms")
+                                print(f"  Avg per token: {avg_token_time:.1f}ms")
+                                print(f"  Min/Max: {min(token_times):.1f}ms / {max(token_times):.1f}ms")
+                                print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + total_decoder_time:.1f}ms")
+
                             self.results_queue.put(transcription)
                             transcriptions.append(transcription)
                         except Empty:
@@ -465,8 +488,11 @@ def main():
 
         # Preprocess the audio file
         print("Preprocessing audio...")
+        preprocess_start = time.time()
         mel_spectrogram = get_audio(args.audio_file)
+        preprocess_time_ms = (time.time() - preprocess_start) * 1000
         print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
+        print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
         print()
 
         # Send data to pipeline
