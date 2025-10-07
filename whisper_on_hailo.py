@@ -11,20 +11,35 @@ from hailo_platform import (HEF, VDevice, HailoSchedulingAlgorithm, FormatType)
 from transformers import AutoTokenizer
 from queue import Queue, Empty
 from threading import Thread
+import onnxruntime as ort
 
 # For efficient audio preprocessing
 import librosa
 import torch
 
 
-# call
-
-# orig HEFs
-# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef   --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/hello_world.wav
+# Usage Examples:
 #
-# my HEF for encoder
-# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/my_converted/whisper_tiny_encoder_10s_hailo_final_optimized.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef   --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/jfk_asknot.wav
-
+# 1. HEF mode (Hailo encoder + HEF decoder without KV-cache, ~70ms/token):
+#    python whisper_on_hailo.py \
+#      --encoder_hef_file /path/to/encoder.hef \
+#      --decoder_hef_file /path/to/decoder.hef \
+#      --decoder_assets_path /path/to/decoder_assets \
+#      --audio_file audio.wav
+#
+# 2. Hybrid mode (Hailo encoder + ONNX decoder with KV-cache, ~6-12ms/token):
+#    python whisper_on_hailo.py \
+#      --encoder_hef_file /path/to/encoder.hef \
+#      --decoder_onnx_dir /path/to/onnx_decoders \
+#      --audio_file audio.wav
+#
+# Example with full paths:
+# HEF mode:
+# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --decoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-decoder-fixed-sequence-matmul-split_h8l.hef --decoder_assets_path /home/katrintomanek/dev/hailo-rpi5-examples/whisper/assets/decoder_assets --audio_file ~/dev/audio_samples/hello_world.wav
+# /home/katrintomanek/dev/hailo_whisper_convert/my_converted/whisper_tiny_encoder_10s_hailo_final_optimized.hef
+#
+# Hybrid mode (recommended for speed):
+# python whisper_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --decoder_onnx_dir /home/katrintomanek/dev/hailo_whisper_convert/my_converted --audio_file ~/dev/audio_samples/hello_world.wav
 # before - download assets
 # 
 # wget -P decoder_assets/tiny/decoder_tokenization \
@@ -184,38 +199,57 @@ class HailoWhisperPipeline:
     A pipeline for running inference using Hailo's Whisper models.
     """
 
-    def __init__(self, encoder_model_path: str, decoder_model_path: str, variant="tiny",
-                 decoder_assets_path=None, multi_process_service=False):
+    def __init__(self, encoder_model_path: str, decoder_model_path: str = None, variant="tiny",
+                 decoder_assets_path=None, multi_process_service=False, decoder_onnx_dir=None):
         """
         Initialize the pipeline.
 
-        :param encoder_model_path: Path to the encoder model file.
-        :param decoder_model_path: Path to the decoder model file.
+        :param encoder_model_path: Path to the encoder HEF file.
+        :param decoder_model_path: Path to the decoder HEF file (not used if decoder_onnx_dir is provided).
         :param variant: Model variant (e.g., "tiny", "base").
-        :param decoder_assets_path: Path to decoder assets directory (token embeddings).
+        :param decoder_assets_path: Path to decoder assets directory (only for HEF decoder).
         :param multi_process_service: Enable multi-process service mode.
+        :param decoder_onnx_dir: Path to directory containing ONNX decoder files (decoder_model.onnx and decoder_with_past_model.onnx).
+                                 If provided, uses ONNX decoder instead of HEF decoder.
         """
         self.encoder_model_path = encoder_model_path
         self.decoder_model_path = decoder_model_path
+        self.decoder_onnx_dir = decoder_onnx_dir
         self.timeout_ms = 100000000
         self.variant = variant
 
         self.decoding_sequence_length = 32 if ("tiny" in self.variant) else 24
         self.multi_process_service = multi_process_service
 
-        # Set decoder assets path
-        if decoder_assets_path is None:
-            # Default to looking in the same directory as this script
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            self.decoder_assets_path = os.path.join(base_path, "decoder_assets")
+        # Determine decoder mode
+        self.use_onnx_decoder = decoder_onnx_dir is not None
+
+        if self.use_onnx_decoder:
+            # ONNX decoder mode - no token embeddings needed
+            print(f"[INFO] Using ONNX decoder from: {decoder_onnx_dir}")
+            self.decoder_init_path = os.path.join(decoder_onnx_dir, "decoder_model.onnx")
+            self.decoder_cached_path = os.path.join(decoder_onnx_dir, "decoder_with_past_model.onnx")
+
+            if not os.path.exists(self.decoder_init_path):
+                raise FileNotFoundError(f"ONNX decoder not found: {self.decoder_init_path}")
+            if not os.path.exists(self.decoder_cached_path):
+                raise FileNotFoundError(f"ONNX cached decoder not found: {self.decoder_cached_path}")
         else:
-            self.decoder_assets_path = decoder_assets_path
+            # HEF decoder mode - need token embeddings
+            print(f"[INFO] Using HEF decoder")
+            # Set decoder assets path
+            if decoder_assets_path is None:
+                # Default to looking in the same directory as this script
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                self.decoder_assets_path = os.path.join(base_path, "decoder_assets")
+            else:
+                self.decoder_assets_path = decoder_assets_path
 
-        # Token embedding
-        self.token_embedding_weight = self._load_token_embedding_weight()
-        self.onnx_add_input = self._load_onnx_add_input()
+            # Token embedding
+            self.token_embedding_weight = self._load_token_embedding_weight()
+            self.onnx_add_input = self._load_onnx_add_input()
+            self.constant_output_0 = np.array([1])  # Unsqueeze axis
 
-        self.constant_output_0 = np.array([1])  # Unsqueeze axis
         self._load_tokenizer()
 
         self.data_queue = Queue()
@@ -281,6 +315,15 @@ class HailoWhisperPipeline:
     def _inference_loop(self):
         """
         Main inference loop for processing input data and generating transcriptions.
+        """
+        if self.use_onnx_decoder:
+            self._inference_loop_onnx()
+        else:
+            self._inference_loop_hef()
+
+    def _inference_loop_hef(self):
+        """
+        Inference loop using HEF decoder (without KV-cache).
         """
         params = VDevice.create_params()
         params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
@@ -416,6 +459,153 @@ class HailoWhisperPipeline:
                         except Empty:
                             pass  # No data yet, continue looping
 
+    def _inference_loop_onnx(self):
+        """
+        Inference loop using ONNX decoder with KV-cache (hybrid mode: Hailo encoder + ONNX decoder).
+        """
+        params = VDevice.create_params()
+        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+
+        if self.multi_process_service:
+            params.multi_process_service = True
+            params.group_id = "SHARED"
+
+        # Load ONNX decoder sessions
+        decoder_init_session = ort.InferenceSession(self.decoder_init_path)
+        decoder_cached_session = ort.InferenceSession(self.decoder_cached_path)
+
+        # Get output names for cache mapping
+        decoder_outputs = [output.name for output in decoder_init_session.get_outputs()]
+        decoder_with_past_outputs = [output.name for output in decoder_cached_session.get_outputs()]
+
+        with VDevice(params) as vdevice:
+            encoder_infer_model = vdevice.create_infer_model(self.encoder_model_path)
+            encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
+            encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
+
+            with encoder_infer_model.configure() as encoder_configured_infer_model:
+                encoder_bindings = encoder_configured_infer_model.create_bindings()
+
+                while self.running:
+                    try:
+                        # Wait for new data with a timeout to allow clean exit
+                        input_mel = self.data_queue.get(timeout=1)
+
+                        transcriptions = []
+                        input_mel = np.ascontiguousarray(input_mel)
+                        encoder_bindings.input().set_buffer(input_mel)
+                        buffer = np.zeros(encoder_infer_model.output().shape).astype(np.float32)
+                        encoder_bindings.output().set_buffer(buffer)
+
+                        # Time encoder inference
+                        encoder_start = time.time()
+                        encoder_configured_infer_model.run([encoder_bindings], self.timeout_ms)
+                        encoder_time_ms = (time.time() - encoder_start) * 1000
+                        encoded_features = encoder_bindings.output().get_buffer()
+
+                        # Debug: Print encoder output info
+                        print(f"[TIMING] Encoder: {encoder_time_ms:.1f}ms")
+                        print(f"[DEBUG] Encoder output shape: {encoded_features.shape}")
+                        print(f"[DEBUG] Encoder output range: [{encoded_features.min():.3f}, {encoded_features.max():.3f}]")
+                        print(f"[DEBUG] Encoder output mean: {encoded_features.mean():.3f}, std: {encoded_features.std():.3f}")
+
+                        # Decoder - Use Whisper's forced decoder start tokens for ONNX
+                        forced_tokens = [50258, 50259, 50359, 50363]  # <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
+                        generated_tokens = forced_tokens.copy()
+                        token_times = []
+                        past_key_values_dict = {}
+
+                        print(f"[DEBUG] Starting ONNX decoder with forced tokens: {forced_tokens}")
+
+                        # Run Decoder with KV-cache
+                        max_new_tokens = self.decoding_sequence_length - len(forced_tokens)
+                        for step in range(max_new_tokens):
+                            step_start = time.time()
+
+                            if not past_key_values_dict:
+                                # First pass: process forced tokens and initialize cache
+                                input_ids = np.array([forced_tokens], dtype=np.int64)
+                                outputs = decoder_init_session.run(None, {
+                                    'input_ids': input_ids,
+                                    'encoder_hidden_states': encoded_features
+                                })
+                                logits = outputs[0]
+
+                                # Store ALL cache outputs
+                                for idx, output_name in enumerate(decoder_outputs[1:], 1):
+                                    if "present" in output_name:
+                                        past_name = output_name.replace("present.", "past_key_values.")
+                                        past_key_values_dict[past_name] = outputs[idx]
+
+                                # Get logits for last forced token position
+                                next_token_logits = logits[0, -1, :].copy()
+                            else:
+                                # Subsequent passes: process only 1 new token using cache
+                                current_input_ids = np.array([[generated_tokens[-1]]], dtype=np.int64)
+                                inputs = {'input_ids': current_input_ids}
+                                inputs.update(past_key_values_dict)
+
+                                outputs = decoder_cached_session.run(None, inputs)
+                                logits = outputs[0]
+
+                                # Update cache for next iteration
+                                for idx, output_name in enumerate(decoder_with_past_outputs[1:], 1):
+                                    if "present" in output_name:
+                                        past_name = output_name.replace("present.", "past_key_values.")
+                                        past_key_values_dict[past_name] = outputs[idx]
+
+                                next_token_logits = logits[0, -1, :].copy()
+
+                            # Apply repetition penalty
+                            repetition_penalty = 1.5
+                            tokens_to_penalize = set(generated_tokens[len(forced_tokens):])
+                            for token_id in tokens_to_penalize:
+                                if next_token_logits[token_id] > 0:
+                                    next_token_logits[token_id] /= repetition_penalty
+                                else:
+                                    next_token_logits[token_id] *= repetition_penalty
+
+                            next_token = np.argmax(next_token_logits)
+
+                            step_time_ms = (time.time() - step_start) * 1000
+                            token_times.append(step_time_ms)
+
+                            # Debug: Show token generation with timing
+                            token_text = self.tokenizer.decode([next_token]) if next_token < len(self.tokenizer) else f"<{next_token}>"
+                            top_3_tokens = np.argsort(next_token_logits)[-3:][::-1]
+                            print(f"[TIMING] Step {step}: {step_time_ms:.1f}ms | token={next_token} '{token_text}' | top-3: {top_3_tokens}")
+
+                            # Check for EOS or end-of-text tokens
+                            if next_token in [50256, 50257]:
+                                print(f"[DEBUG] EOS token {next_token} reached at step {step}")
+                                break
+
+                            generated_tokens.append(int(next_token))
+
+                        # Convert token IDs to text (skip forced tokens)
+                        transcription = self.tokenizer.decode(
+                            generated_tokens, skip_special_tokens=True
+                        )
+
+                        # Print decoder timing summary
+                        if token_times:
+                            total_decoder_time = sum(token_times)
+                            avg_token_time = np.mean(token_times)
+                            print(f"\n[TIMING] Decoder Summary (ONNX with KV-cache):")
+                            print(f"  Total tokens: {len(token_times)}")
+                            print(f"  Total time: {total_decoder_time:.1f}ms")
+                            print(f"  Avg per token: {avg_token_time:.1f}ms")
+                            print(f"  Min/Max: {min(token_times):.1f}ms / {max(token_times):.1f}ms")
+                            if len(token_times) > 1:
+                                print(f"  First token: {token_times[0]:.1f}ms")
+                                print(f"  Subsequent tokens: {np.mean(token_times[1:]):.1f}ms")
+                            print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + total_decoder_time:.1f}ms")
+
+                        self.results_queue.put(transcription)
+                        transcriptions.append(transcription)
+                    except Empty:
+                        pass  # No data yet, continue looping
+
     def send_data(self, data):
         """
         Send new data to the queue.
@@ -445,17 +635,19 @@ class HailoWhisperPipeline:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Whisper on Hailo Inference Pipeline")
+    parser = argparse.ArgumentParser(description="Whisper on Hailo Inference Pipeline (Hybrid Mode Supported)")
     parser.add_argument("--encoder_hef_file", type=str, required=True,
                         help="Path to encoder HEF file")
-    parser.add_argument("--decoder_hef_file", type=str, required=True,
-                        help="Path to decoder HEF file")
+    parser.add_argument("--decoder_hef_file", type=str, default=None,
+                        help="Path to decoder HEF file (not used if --decoder_onnx_dir is provided)")
     parser.add_argument("--audio_file", type=str, required=True,
                         help="Path to audio file to transcribe")
     parser.add_argument("--variant", type=str, default="tiny",
                         help="Model variant (e.g., 'tiny', 'base')")
     parser.add_argument("--decoder_assets_path", type=str, default=None,
-                        help="Path to decoder assets directory (default: ./decoder_assets)")
+                        help="Path to decoder assets directory (only for HEF decoder, default: ./decoder_assets)")
+    parser.add_argument("--decoder_onnx_dir", type=str, default=None,
+                        help="Path to directory containing ONNX decoder files (enables hybrid mode: Hailo encoder + ONNX decoder with KV-cache)")
     parser.add_argument("--multi_process_service", action="store_true",
                         help="Enable multi-process service mode")
 
@@ -466,9 +658,19 @@ def main():
         print(f"Error: Audio file not found: {args.audio_file}")
         return 1
 
+    # Validate decoder arguments
+    if args.decoder_onnx_dir is None and args.decoder_hef_file is None:
+        print("Error: Either --decoder_hef_file or --decoder_onnx_dir must be provided")
+        return 1
+
     print(f"Initializing Whisper on Hailo Pipeline...")
     print(f"  Encoder HEF: {args.encoder_hef_file}")
-    print(f"  Decoder HEF: {args.decoder_hef_file}")
+    if args.decoder_onnx_dir:
+        print(f"  Decoder: ONNX (hybrid mode)")
+        print(f"  ONNX decoder dir: {args.decoder_onnx_dir}")
+    else:
+        print(f"  Decoder: HEF")
+        print(f"  Decoder HEF: {args.decoder_hef_file}")
     print(f"  Variant: {args.variant}")
     print(f"  Audio file: {args.audio_file}")
     print()
@@ -480,7 +682,8 @@ def main():
             decoder_model_path=args.decoder_hef_file,
             variant=args.variant,
             decoder_assets_path=args.decoder_assets_path,
-            multi_process_service=args.multi_process_service
+            multi_process_service=args.multi_process_service,
+            decoder_onnx_dir=args.decoder_onnx_dir
         )
 
         print("Pipeline initialized successfully!")
