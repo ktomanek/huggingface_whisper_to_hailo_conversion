@@ -17,6 +17,10 @@ import torch
 # Runs
 # python whisper_encoder_on_hailo.py --encoder_orig_onnx_file  /home/katrintomanek/dev/hailo-rpi5-examples/whisper/models/onnx/  --audio_file ~/dev/audio_samples/hello_world.wav
 # python whisper_encoder_on_hailo.py --encoder_onnx_file  /home/katrintomanek/dev/hailo-rpi5-examples/whisper/models/onnx/converted_for_hailo/whisper_tiny_encoder_10s_hailo_final.onnx   --audio_file ~/dev/audio_samples/hello_world.wav
+# python whisper_encoder_on_hailo.py --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef --audio_file ~/dev/audio_samples/hello_world.wav
+
+
+# python whisper_encoder_on_hailo.py --audio_file ~/dev/audio_samples/hello_world.wav --encoder_hef_file /home/katrintomanek/dev/hailo_whisper_convert/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef   --encoder_orig_onnx_file  /home/katrintomanek/dev/hailo-rpi5-examples/whisper/models/onnx/ --encoder_onnx_file  /home/katrintomanek/dev/hailo-rpi5-examples/whisper/models/onnx/converted_for_hailo/whisper_tiny_encoder_10s_hailo_final.onnx
 
 # Usage Examples:
 #
