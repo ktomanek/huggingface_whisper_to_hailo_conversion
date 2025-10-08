@@ -64,7 +64,7 @@ import torch
 excluded_tokens = [11, 13]  # Punctuation tokens to exclude from repetition penalty
 
 
-def apply_repetition_penalty(logits, generated_tokens, penalty=1.5, last_window=8):
+def _apply_repetition_penalty(logits, generated_tokens, penalty=1.5, last_window=8):
     """
     Apply repetition penalty to the logits.
     Args:
@@ -90,6 +90,8 @@ def apply_repetition_penalty(logits, generated_tokens, penalty=1.5, last_window=
 # Audio Preprocessing (Hailo-efficient implementation)
 # ============================================================================
 
+# TODO factor our into separate file
+
 # Audio hyperparameters (from Whisper)
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -97,7 +99,7 @@ HOP_LENGTH = 160
 N_SAMPLES_10S = 10 * SAMPLE_RATE  # 160000 samples in 10 seconds
 
 
-def pad_or_trim(array, length: int = N_SAMPLES_10S, *, axis: int = -1):
+def _pad_or_trim(array, length: int = N_SAMPLES_10S, *, axis: int = -1):
     """Pad or trim the audio array to specified length."""
     if torch.is_tensor(array):
         if array.shape[axis] > length:
@@ -118,7 +120,7 @@ def pad_or_trim(array, length: int = N_SAMPLES_10S, *, axis: int = -1):
     return array
 
 
-def log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0):
+def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0):
     """
     Compute log-Mel spectrogram using PyTorch STFT (Hailo-efficient approach).
 
@@ -157,7 +159,7 @@ def log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0)
     return log_spec
 
 
-def get_audio(audio_file, chunk_length=10, is_nhwc=True):
+def get_mel_spectrogram(audio_file, chunk_length=10, is_nhwc=True):
     """
     Load audio file and convert to mel spectrogram (Hailo-efficient implementation).
 
@@ -182,10 +184,10 @@ def get_audio(audio_file, chunk_length=10, is_nhwc=True):
 
     # Pad or trim to target length
     segment_samples = chunk_length * SAMPLE_RATE
-    audio_torch = pad_or_trim(audio_torch, int(segment_samples))
+    audio_torch = _pad_or_trim(audio_torch, int(segment_samples))
 
     # Compute mel spectrogram using efficient PyTorch STFT
-    mel = log_mel_spectrogram(audio_torch).to("cpu")
+    mel = _log_mel_spectrogram(audio_torch).to("cpu")
 
     # Convert to numpy and reshape to [1, 80, 1, 1000]
     mel = mel.numpy()
@@ -429,7 +431,7 @@ class HailoWhisperPipeline:
 
                                 # Decoder post-processing
                                 repetition_penalty = 1.5
-                                logits = apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=repetition_penalty)
+                                logits = _apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=repetition_penalty)
                                 next_token = np.argmax(logits)
 
                                 step_time_ms = (time.time() - step_start) * 1000
@@ -664,13 +666,12 @@ def main():
 
     # Check if audio file exists
     if not os.path.exists(args.audio_file):
-        print(f"Error: Audio file not found: {args.audio_file}")
-        return 1
+        raise ValueError(f"Error: Audio file not found: {args.audio_file}")
 
     # Validate decoder arguments
     if args.decoder_onnx_dir is None and args.decoder_hef_file is None:
-        print("Error: Either --decoder_hef_file or --decoder_onnx_dir must be provided")
-        return 1
+        raise ValueError("Error: Either --decoder_hef_file or --decoder_onnx_dir must be provided")
+
 
     print(f"Initializing Whisper on Hailo Pipeline...")
     print(f"  Encoder HEF: {args.encoder_hef_file}")
@@ -684,55 +685,46 @@ def main():
     print(f"  Audio file: {args.audio_file}")
     print()
 
-    try:
-        # Initialize the pipeline
-        pipeline = HailoWhisperPipeline(
-            encoder_model_path=args.encoder_hef_file,
-            decoder_model_path=args.decoder_hef_file,
-            variant=args.variant,
-            decoder_assets_path=args.decoder_assets_path,
-            multi_process_service=args.multi_process_service,
-            decoder_onnx_dir=args.decoder_onnx_dir
-        )
+    # Initialize the pipeline
+    pipeline = HailoWhisperPipeline(
+        encoder_model_path=args.encoder_hef_file,
+        decoder_model_path=args.decoder_hef_file,
+        variant=args.variant,
+        decoder_assets_path=args.decoder_assets_path,
+        multi_process_service=args.multi_process_service,
+        decoder_onnx_dir=args.decoder_onnx_dir
+    )
 
-        print("Pipeline initialized successfully!")
-        print()
+    print("Pipeline initialized successfully!")
+    print()
 
-        # Preprocess the audio file
-        print("Preprocessing audio...")
-        preprocess_start = time.time()
-        mel_spectrogram = get_audio(args.audio_file)
-        preprocess_time_ms = (time.time() - preprocess_start) * 1000
-        print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
-        print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
-        print()
+    # Preprocess the audio file
+    print("Preprocessing audio...")
+    preprocess_start = time.time()
+    mel_spectrogram = get_mel_spectrogram(args.audio_file)
+    preprocess_time_ms = (time.time() - preprocess_start) * 1000
+    print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
+    print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
+    print()
 
-        # Send data to pipeline
-        print("Running inference...")
-        pipeline.send_data(mel_spectrogram)
+    # Send data to pipeline
+    print("Running inference...")
+    pipeline.send_data(mel_spectrogram)
 
-        # Wait for and get transcription
-        transcription = pipeline.get_transcription()
+    # Wait for and get transcription
+    transcription = pipeline.get_transcription()
 
-        # Stop the pipeline
-        pipeline.stop()
+    # Stop the pipeline
+    pipeline.stop()
 
-        # Print result
-        print()
-        print("=" * 70)
-        print("TRANSCRIPTION:")
-        print("=" * 70)
-        print(f"{transcription}")
-        print("=" * 70)
-        print()
-
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-    return 0
+    # Print result
+    print()
+    print("=" * 70)
+    print("TRANSCRIPTION:")
+    print("=" * 70)
+    print(f"{transcription}")
+    print("=" * 70)
+    print()
 
 
 if __name__ == "__main__":
