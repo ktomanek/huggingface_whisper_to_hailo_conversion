@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+
+This to be run on HAILO directly
+
+# TODO merge with whisper_encoder_on_hailo.py
+
 Whisper Encoder+Decoder Benchmarking on Hailo
 Compare full transcription outputs across different encoders
 """

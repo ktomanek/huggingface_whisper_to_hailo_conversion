@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+
+This to be run on HAILO directly
+
 Standalone Whisper on Hailo Pipeline
 Based on HailoWhisperPipeline from Hailo Application Code Examples
 """

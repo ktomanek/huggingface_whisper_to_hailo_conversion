@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+This to be run on HAILO directly
+
+code with no external dependencies - all included in here
+
 Whisper Encoder Benchmarking on Hailo
 Compare HEF vs ONNX encoder performance on Hailo hardware
 """

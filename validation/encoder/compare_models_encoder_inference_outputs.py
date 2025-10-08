@@ -1,12 +1,14 @@
+# compare reference Hailo onnx encoder and our converted encoder
 import onnxruntime as ort
 import numpy as np
 
-our_encoder_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
-ref_encoder_path = "hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
+our_encoder_path = "models/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+ref_encoder_path = "models/hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
 
 
 your_session = ort.InferenceSession(our_encoder_path)
 ref_session = ort.InferenceSession(ref_encoder_path)
+print("instantiated sessions")
 
 input_data = np.random.randn(1, 80, 1, 1000).astype(np.float32)
 

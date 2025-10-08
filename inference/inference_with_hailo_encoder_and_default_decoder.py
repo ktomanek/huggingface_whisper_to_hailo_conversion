@@ -28,7 +28,7 @@ import os
 import librosa
 
 # Add hailo_preprocessing to path for mel computation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'hailo_preprocessing'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../hailo_preprocessing'))
 import preprocessing  # Hailo's efficient mel computation
 
 # =============================================================================
@@ -66,7 +66,7 @@ MAX_NEW_TOKENS = 28           # 32 total - 4 forced tokens
 # =============================================================================
 
 # 10s encoder (Hailo-optimized)
-ENCODER_10S_PATH = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+ENCODER_10S_PATH = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/models/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
 
 # 30s encoder (standard ONNX)
 ENCODER_30S_PATH = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/encoder_model.onnx"

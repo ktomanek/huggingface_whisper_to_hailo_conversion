@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Run inference and compare results of both models (our converted and Hailo reference).
 
-1. Loads both our custom models AND Hailo reference models
-2. Processes real audio (samples/jfk_asknot.wav) with official Whisper preprocessing
-3. Runs identical input through both model pairs (encoder → decoder pipeline)
-4. Shows detailed side-by-side comparison of outputs:
-   - Encoder hidden states comparison
-   - Decoder logits comparison
-   - Token predictions comparison
-   - Decoded text comparison
+Demonstrates 2 decoding technique and compares results:
+1. autoregressive decoding without caching to full max length (simulating Hailo NPU behavior)
+2. Efficient decoding with KV cache (recommended production approach)
+
+
+This clearly shows that the hybrid approach is best - encoder on NPU, decoder with KV cache on CPU.
+
+For preprocessing: Use Whisper's official preprocessing
 """
 
 import numpy as np
@@ -457,11 +456,10 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
 
 def main():
 
-    new_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
-    # new_decoder_onnx_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_decoder_10s_hailo_final.onnx"
+    new_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/models/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
     default_whisper_decoder = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_model.onnx"
-    reference_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
-    reference_decoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/hailo_reference_models/tiny/tiny-whisper-decoder-10s-seq-32.onnx"
+    reference_encoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/models/hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
+    reference_decoder_onnx_path = "/Users/katrintomanek/dev/huggingface_whisper_to_hailo_conversion/models/hailo_reference_models/tiny/tiny-whisper-decoder-10s-seq-32.onnx"
 
     # test_audio="samples/jfk_asknot.wav"
     test_audio="samples/hello_world.wav"

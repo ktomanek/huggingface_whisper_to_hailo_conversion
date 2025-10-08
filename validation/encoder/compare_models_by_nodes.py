@@ -1,3 +1,4 @@
+# compare reference Hailo onnx encoder and our converted encoder by comparing intermediate node outputs
 
 import onnx
 from onnx import helper
@@ -8,8 +9,8 @@ import numpy as np
 np.random.seed(42)
 
 
-our_encoder_path = "hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
-ref_encoder_path = "hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
+our_encoder_path = "models/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx"
+ref_encoder_path = "models/hailo_reference_models/tiny/tiny-whisper-encoder-10s.onnx"
 
 input_data = np.random.randn(1, 80, 1, 1000).astype(np.float32)    
 
