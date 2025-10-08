@@ -1,1 +1,0 @@
-# Hailo preprocessing utilities

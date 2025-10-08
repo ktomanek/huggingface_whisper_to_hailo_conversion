@@ -162,6 +162,14 @@ def run_faster_whisper(audio_file, sample_rate=16000, warmup=True):
     load_time = (time.time() - load_start) * 1000
     print(f"  Model loaded in {load_time:.1f}ms")
 
+    # Load audio (timed separately, excluded from benchmark)
+    print("  Loading audio file...")
+    audio_load_start = time.time()
+    audio, _ = librosa.load(audio_file, sr=sample_rate, mono=True)
+    audio_load_time = (time.time() - audio_load_start) * 1000
+    print(f"  Audio loaded in {audio_load_time:.1f}ms")
+    print(f"  Audio duration: {len(audio) / sample_rate:.2f}s")
+
     # Warmup run
     if warmup:
         print("  Running warmup inference...")
@@ -179,14 +187,16 @@ def run_faster_whisper(audio_file, sample_rate=16000, warmup=True):
         warmup_time = (time.time() - warmup_start) * 1000
         print(f"  Warmup completed in {warmup_time:.1f}ms")
 
-    # Load audio
-    audio, _ = librosa.load(audio_file, sr=sample_rate, mono=True)
+    # Measure preprocessing separately (mel spectrogram computation)
+    print("  Measuring preprocessing time...")
+    preprocess_start = time.time()
+    features = model.feature_extractor(audio)
+    preprocess_time = (time.time() - preprocess_start) * 1000
+    print(f"  Preprocessing: {preprocess_time:.2f}ms")
 
-    print(f"  Audio duration: {len(audio) / sample_rate:.2f}s")
-
-    # Run transcription with timing (inference only, no loading)
-    # Note: FasterWhisper does its own preprocessing internally (mel spectrogram computation)
-    print("  Running actual inference (includes internal preprocessing)...")
+    # Now run full transcription (which will redo preprocessing internally)
+    # Note: FasterWhisper does its own preprocessing internally, so total time includes it
+    print("  Running full transcription (includes preprocessing + inference)...")
     start = time.time()
     segments, info = model.transcribe(
         audio,
@@ -205,13 +215,18 @@ def run_faster_whisper(audio_file, sample_rate=16000, warmup=True):
         transcription += segment.text.strip() + " "
         segment_count += 1
 
-    inference_time = (time.time() - start) * 1000
+    total_time = (time.time() - start) * 1000
     transcription = transcription.strip()
+
+    # Estimate inference time by subtracting preprocessing
+    inference_time = total_time - preprocess_time
 
     print(f"  Processed {segment_count} segments")
     print(f"  Detected language: {info.language} (probability: {info.language_probability:.2f})")
+    print(f"  Total time: {total_time:.2f}ms")
+    print(f"  Estimated breakdown: preprocessing={preprocess_time:.2f}ms, inference={inference_time:.2f}ms")
 
-    return transcription, inference_time
+    return transcription, total_time
 
 
 # ============================================================================

@@ -2,15 +2,21 @@
 """
 Hailo-Optimized Whisper Inference Example
 
-This script demonstrates production-ready inference combining:
-- Hailo's efficient preprocessing (PyTorch STFT, cached mel filters)
-- 10s encoder converted for Hailo compatibility
-- Efficient cached decoder with anti-hallucination strategies
+(1) Compare preprocessing times
+* huggingface default
+* Hailo's efficient preprocessing (PyTorch STFT, cached mel filters)
 
-Anti-hallucination strategies:
+
+(2) inference with:
+- hailo optimized encoder: 10s encoder converted for Hailo compatibility
+- default onnx decoder: standard ONNX decoder with KV cache (Efficient cached decode)
+
+(3) Hallucination analysis with anti-hallucination strategies:
 1. Encoder output padding (to match training distribution)
 2. Repetition penalty (discourage token repetition)
 3. EOS boosting (proactive early stopping)
+
+
 """
 
 import onnxruntime as ort
