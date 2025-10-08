@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compare the three anti-hallucination configurations on sample audio.
+Compare the three anti-hallucination configurations for the efficient auto-regressive decoder.
 
 This script tests all three strategies documented in the efficiency notes:
 1. Conservative: Full padding (1500), no interventions
@@ -21,7 +21,7 @@ def run_config(audio_path, config_name, orig_max_len, rep_penalty, eos_threshold
     print(f"{'='*70}")
 
     # Load the module and override configs
-    spec = importlib.util.spec_from_file_location("hailo_inference", "hailo_inference_example.py")
+    spec = importlib.util.spec_from_file_location("hailo_inference", "inference/simulation/compare_preprocessing_and_encoder_types.py")
     module = importlib.util.module_from_spec(spec)
 
     # Override configuration

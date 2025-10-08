@@ -17,6 +17,12 @@ Hailo-Optimized Whisper Inference Example
 3. EOS boosting (proactive early stopping)
 
 
+To compare preprocessing
+python inference/simulation/compare_preprocessing_and_encoder_types.py samples/172.mp3 --compare-preprocessing
+
+To compare encoder types:
+python inference/simulation/compare_preprocessing_and_encoder_types.py samples/172.mp3 --compare-encoders
+
 """
 
 import onnxruntime as ort
@@ -28,7 +34,7 @@ import os
 import librosa
 
 # Add hailo_preprocessing to path for mel computation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../hailo_preprocessing'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../hailo_preprocessing'))
 import preprocessing  # Hailo's efficient mel computation
 
 # =============================================================================
@@ -476,9 +482,6 @@ Examples:
   # Use HuggingFace preprocessing (for comparison)
   python hailo_inference_example.py audio.wav --preprocessing huggingface
 
-  # Compare both preprocessing methods
-  python hailo_inference_example.py audio.wav --compare
-
   # Compare 10s vs 30s encoder performance
   python hailo_inference_example.py audio.wav --compare-encoders
         """
@@ -491,7 +494,7 @@ Examples:
         help="Preprocessing method to use (default: hailo)"
     )
     parser.add_argument(
-        "--compare",
+        "--compare-preprocessing",
         action="store_true",
         help="Run both preprocessing methods and compare timing"
     )
@@ -575,7 +578,7 @@ Examples:
             print(f"\n⚠️  Transcriptions differ slightly")
             print(f"   This is expected - 30s encoder may handle punctuation differently")
 
-    elif args.compare:
+    elif args.compare_preprocessing:
         # Run both methods and compare
         print("\n" + "="*70)
         print("PREPROCESSING COMPARISON")

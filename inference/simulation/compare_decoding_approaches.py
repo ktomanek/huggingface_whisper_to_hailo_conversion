@@ -32,33 +32,7 @@ ORIG_MAX_LEN = 1500
 # Debug output: Show detailed penalty/boost decisions
 DEBUG_OUTPUT = False  # Set to True to see per-token decisions
 
-
-# Option 1 (Minimal padding + EOS boost):
-# ORIG_MAX_LEN = 500          # No padding (minimal compute)
-# REPETITION_PENALTY = 1.01   # Very mild
-# EOS_BOOST_THRESHOLD = 0.5   # Aggressive EOS preference
-# - Lowest compute overhead
-# - Relies on EOS boosting to stop correctly
-# 4.58x speedup 
-#    Total time: 37.0ms
-#    Avg time per token: 2.4ms
-#    Decoded text: ' Hello world.'
-
-# Option 2 (Moderate padding + mild penalty):
-# ORIG_MAX_LEN = 600-650      # Some padding
-# REPETITION_PENALTY = 1.1    # Mild penalty
-# EOS_BOOST_THRESHOLD = 0.3   # Moderate EOS preference
-# - Balanced approach
-# - Multiple safety nets
-
-# Option 3 (Safe padding, minimal intervention):
-# ORIG_MAX_LEN = 700+         # Sufficient padding
-# REPETITION_PENALTY = 1.0    # No penalty needed
-# EOS_BOOST_THRESHOLD = 0.0   # Disabled
-# - Most reliable
-# - Higher compute (but still 2x better than padding to 1500)
-
-def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio="samples/hello_world.wav"):
+def validate_model(new_encoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio="samples/hello_world.wav"):
     """Complete side-by-side inference comparison"""
     print("🔍 COMPREHENSIVE INFERENCE COMPARISON")
     print("=" * 60)
@@ -70,16 +44,13 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
 
     # Model paths - use provided paths or defaults
     our_encoder = new_encoder_onnx_path
-    our_decoder = new_decoder_onnx_path
     ref_encoder = reference_encoder_onnx_path
     ref_decoder = reference_decoder_onnx_path
 
     print(f"Using custom encoder: {our_encoder}")
-    print(f"Using custom decoder: {our_decoder}")
 
 
     our_enc_session = ort.InferenceSession(our_encoder)
-    our_dec_session = ort.InferenceSession(our_decoder)
     ref_enc_session = ort.InferenceSession(ref_encoder)
     ref_dec_session = ort.InferenceSession(ref_decoder)
 
@@ -143,9 +114,9 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
     print(f"\n🔁 AUTOREGRESSIVE DECODING TEST (NPU Simulation)")
     print("=" * 30)
     print("Testing: True token-by-token autoregressive generation")
-    print("NOTE: This simulates Hailo NPU decoder behavior with full 528x overhead:")
-    print("  - 32x: Processes all 32 positions when only 1 prediction needed")
-    print("  - 16.5x: No KV cache, recomputes attention for all previous tokens")
+    print("NOTE: This simulates Hailo NPU decoder behavior:")
+    print("  - Processes all 32 positions even when only 1 prediction needed")
+    print("  - No KV cache, recomputes attention for all previous tokens")
     print("  - This matches Hailo's fixed-shape ONNX requirements")
 
     max_new_tokens = 28  # Generate up to 28 new tokens (total 32 with forced)
@@ -184,27 +155,6 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
 
         return generated_tokens, token_times
 
-    # Generate with our decoder
-    print(f"\n🤖 Our decoder autoregressive generation:")
-    start_time = time.time()
-    our_autoregressive_tokens, our_token_times = autoregressive_decode(our_dec_session, our_enc_output, max_new_tokens)
-    our_decode_time = time.time() - start_time
-    our_meaningful = our_autoregressive_tokens[4:]  # Skip forced tokens
-
-    # Print tokens with timing
-    print(f"   Generated tokens with timing (ms):")
-    for i, (token, token_time) in enumerate(zip(our_meaningful, our_token_times)):
-        token_text = tokenizer.decode([token], skip_special_tokens=True)
-        print(f"      [{i}] {token} '{token_text}' ({token_time*1000:.1f}ms)")
-
-    print(f"   Total time: {our_decode_time*1000:.1f}ms")
-    print(f"   Avg time per token: {np.mean(our_token_times)*1000:.1f}ms")
-    try:
-        our_autoregressive_text = tokenizer.decode(our_meaningful, skip_special_tokens=True)
-        print(f"   Decoded text: '{our_autoregressive_text}'")
-    except Exception as e:
-        print(f"   Decode failed: {e}")
-
     # Generate with reference decoder
     print(f"\n🤖 Reference decoder autoregressive generation:")
     start_time = time.time()
@@ -226,25 +176,15 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
     except Exception as e:
         print(f"   Decode failed: {e}")
 
-    # Compare autoregressive results
-    print(f"\n📊 Autoregressive Comparison:")
-    min_length = min(len(our_autoregressive_tokens), len(ref_autoregressive_tokens))
-    matches = sum(1 for i in range(min_length) if our_autoregressive_tokens[i] == ref_autoregressive_tokens[i])
-    print(f"   Token agreement: {matches}/{min_length} ({100*matches/min_length:.1f}%)")
-    print(f"   Our model generated: {len(our_autoregressive_tokens)} total tokens")
-    print(f"   Ref model generated: {len(ref_autoregressive_tokens)} total tokens")
-
-
     # ========================================
     # EFFICIENT CACHED DECODING TEST (HYBRID ARCHITECTURE)
+    # decoder exported and converted with Optimum
     # ========================================
     print(f"\n⚡ EFFICIENT CACHED DECODING TEST (Hybrid: Encoder on NPU, Decoder with KV Cache)")
     print("=" * 30)
     print("Testing: Encoder on NPU (Hailo) + Efficient decoder with KV cache")
-    print("NOTE: This is the RECOMMENDED production architecture:")
     print("  - ✅ Encoder uses NPU (fast, fixed shape - perfect for Hailo)")
-    print("  - ✅ Decoder uses KV cache (eliminates 16.5x overhead)")
-    print("  - ✅ Only 1 token processed per step (eliminates 32x overhead)")
+    print("  - ✅ Decoder uses KV cache and sees only 1 new token at a time")
 
     # Load efficient decoder models with KV cache support
     decoder_init_path = "/Users/katrintomanek/dev/onnx_experiments/converted_models/whisper_tiny_onnx/default/decoder_model.onnx"
@@ -424,9 +364,9 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
     # Compare with NPU simulation results
     print(f"\n📊 Efficiency Comparison:")
     print(f"   NPU simulation:")
-    print(f"      Generated: {len(our_autoregressive_tokens)} tokens")
-    print(f"      Time: {our_decode_time*1000:.1f}ms")
-    print(f"      Time per token: {our_decode_time*1000/len(our_meaningful) if our_meaningful else 0:.1f}ms")
+    print(f"      Generated: {len(ref_autoregressive_tokens)} tokens")
+    print(f"      Time: {ref_decode_time*1000:.1f}ms")
+    print(f"      Time per token: {ref_decode_time*1000/len(ref_meaningful) if ref_meaningful else 0:.1f}ms")
     print(f"   Efficient cached:")
     print(f"      Generated: {len(efficient_tokens)} tokens")
     print(f"      Time: {efficient_decode_time*1000:.1f}ms")
@@ -434,24 +374,14 @@ def validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encod
 
     # Calculate speedup
     if efficient_decode_time > 0:
-        speedup = our_decode_time / efficient_decode_time
+        speedup = ref_decode_time / efficient_decode_time
         print(f"\n   ⚡ Speedup: {speedup:.2f}x faster with KV cache")
         print(f"      (Efficient cached is {speedup:.2f}x faster than NPU simulation)")
 
     # Compare token sequences
-    min_len = min(len(our_autoregressive_tokens), len(efficient_tokens))
-    token_matches = sum(1 for i in range(min_len) if our_autoregressive_tokens[i] == efficient_tokens[i])
+    min_len = min(len(ref_autoregressive_tokens), len(efficient_tokens))
+    token_matches = sum(1 for i in range(min_len) if ref_autoregressive_tokens[i] == efficient_tokens[i])
     print(f"\n   Token agreement: {token_matches}/{min_len} ({100*token_matches/min_len:.1f}%)")
-
-    # # Compare decoded text
-    # if 'our_autoregressive_text' in locals() and 'efficient_text' in locals():
-    #     if our_autoregressive_text == efficient_text:
-    #         print(f"   ✅ Decoded text IDENTICAL")
-    #     else:
-    #         print(f"   ⚠️  Decoded text differs:")
-    #         print(f"      NPU: '{our_autoregressive_text}'")
-    #         print(f"      Efficient: '{efficient_text}'")
-
 
 
 def main():
@@ -465,8 +395,7 @@ def main():
     test_audio="samples/hello_world.wav"
     # test_audio="samples/172.mp3"
     # test_audio="samples/287.mp3"
-    validate_model(new_encoder_onnx_path, reference_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
-    # validate_model(new_encoder_onnx_path, new_decoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
+    validate_model(new_encoder_onnx_path, reference_encoder_onnx_path, reference_decoder_onnx_path,test_audio)
 
 
 if __name__ == "__main__":
