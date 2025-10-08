@@ -140,6 +140,80 @@ def decode_tokens(tokens):
     return text
 
 
+def run_faster_whisper(audio_file, sample_rate=16000, warmup=True):
+    """
+    Run FasterWhisper for comparison.
+
+    Args:
+        audio_file: Path to audio file
+        sample_rate: Audio sample rate
+        warmup: Whether to run warmup inference
+
+    Returns:
+        (transcription, inference_time_ms): Transcription text and inference time
+    """
+    from faster_whisper import WhisperModel
+    import librosa
+
+    # Load model (timed separately)
+    print("  Loading FasterWhisper model...")
+    load_start = time.time()
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    load_time = (time.time() - load_start) * 1000
+    print(f"  Model loaded in {load_time:.1f}ms")
+
+    # Warmup run
+    if warmup:
+        print("  Running warmup inference...")
+        dummy_audio = np.zeros(sample_rate, dtype=np.float32)  # 1 second of silence
+        warmup_start = time.time()
+        list(model.transcribe(
+            dummy_audio,
+            beam_size=1,
+            language='en',  # Set language to skip detection
+            task='transcribe',
+            condition_on_previous_text=False,
+            vad_filter=False,
+            word_timestamps=False,
+        )[0])  # Consume the generator
+        warmup_time = (time.time() - warmup_start) * 1000
+        print(f"  Warmup completed in {warmup_time:.1f}ms")
+
+    # Load audio
+    audio, _ = librosa.load(audio_file, sr=sample_rate, mono=True)
+
+    print(f"  Audio duration: {len(audio) / sample_rate:.2f}s")
+
+    # Run transcription with timing (inference only, no loading)
+    # Note: FasterWhisper does its own preprocessing internally (mel spectrogram computation)
+    print("  Running actual inference (includes internal preprocessing)...")
+    start = time.time()
+    segments, info = model.transcribe(
+        audio,
+        beam_size=1,
+        language='en',  # Set language explicitly to skip language detection
+        task='transcribe',
+        condition_on_previous_text=False,
+        vad_filter=False,
+        word_timestamps=False,
+    )
+
+    # Collect all segments (consuming the generator)
+    transcription = ""
+    segment_count = 0
+    for segment in segments:
+        transcription += segment.text.strip() + " "
+        segment_count += 1
+
+    inference_time = (time.time() - start) * 1000
+    transcription = transcription.strip()
+
+    print(f"  Processed {segment_count} segments")
+    print(f"  Detected language: {info.language} (probability: {info.language_probability:.2f})")
+
+    return transcription, inference_time
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -158,6 +232,8 @@ def main():
                         help="Path to directory containing decoder_model.onnx and decoder_with_past_model.onnx")
     parser.add_argument("--multi_process_service", action="store_true",
                         help="Enable multi-process service mode (HEF only)")
+    parser.add_argument("--include_faster_whisper", action="store_true",
+                        help="Include FasterWhisper (CPU INT8) for comparison")
 
     args = parser.parse_args()
 
@@ -195,6 +271,15 @@ def main():
     session_cached = ort.InferenceSession(decoder_cached_path)
     load_time = (time.time() - load_start) * 1000
     print(f"✅ Decoder models loaded in {load_time:.1f}ms")
+
+    # Warmup decoder with dummy encoder output
+    print("Running decoder warmup...")
+    warmup_start = time.time()
+    dummy_encoder_output = np.random.randn(1, 500, 384).astype(np.float32)
+    _, _ = run_onnx_decoder(decoder_init_path, decoder_cached_path, dummy_encoder_output,
+                           max_length=10, sessions=(session_init, session_cached))
+    warmup_time = (time.time() - warmup_start) * 1000
+    print(f"✅ Decoder warmup completed in {warmup_time:.1f}ms")
     print()
 
     decoder_sessions = (session_init, session_cached)
@@ -211,6 +296,17 @@ def main():
         print("Preprocessing audio (NHWC format for HEF)...")
         mel_input = get_audio(args.audio_file, is_nhwc=True)
         print(f"  Mel spectrogram shape: {mel_input.shape}")
+
+        # Warmup HEF encoder
+        print("Running HEF encoder warmup...")
+        dummy_mel = np.random.randn(*mel_input.shape).astype(np.float32)
+        _, warmup_times = run_hef_encoder(
+            args.encoder_hef_file,
+            dummy_mel,
+            num_iterations=1,
+            multi_process_service=args.multi_process_service
+        )
+        print(f"  Warmup completed in {warmup_times[0]:.1f}ms")
 
         print("Running HEF encoder...")
         encoder_output, timings = run_hef_encoder(
@@ -252,6 +348,16 @@ def main():
         mel_input = get_audio(args.audio_file, is_nhwc=False)
         print(f"  Mel spectrogram shape: {mel_input.shape}")
 
+        # Warmup ONNX encoder
+        print("Running ONNX encoder warmup...")
+        dummy_mel = np.random.randn(*mel_input.shape).astype(np.float32)
+        _, warmup_times = run_onnx_encoder(
+            args.encoder_onnx_file,
+            dummy_mel,
+            num_iterations=1
+        )
+        print(f"  Warmup completed in {warmup_times[0]:.1f}ms")
+
         print("Running ONNX encoder...")
         encoder_output, timings = run_onnx_encoder(
             args.encoder_onnx_file,
@@ -291,6 +397,16 @@ def main():
         mel_input = get_audio_orig_onnx(args.audio_file, target_duration=30)
         print(f"  Mel spectrogram shape: {mel_input.shape}")
 
+        # Warmup original ONNX encoder
+        print("Running original ONNX encoder warmup...")
+        dummy_mel = np.random.randn(*mel_input.shape).astype(np.float32)
+        _, warmup_times = run_onnx_encoder(
+            args.encoder_orig_onnx_file,
+            dummy_mel,
+            num_iterations=1
+        )
+        print(f"  Warmup completed in {warmup_times[0]:.1f}ms")
+
         print("Running original ONNX encoder...")
         encoder_output, timings = run_onnx_encoder(
             args.encoder_orig_onnx_file,
@@ -319,7 +435,29 @@ def main():
         }
 
     # -------------------------------------------------------------------------
-    # 4. COMPARISON
+    # 4. FASTERWHISPER (OPTIONAL)
+    # -------------------------------------------------------------------------
+    if args.include_faster_whisper:
+        print("\n" + "="*70)
+        print("FASTERWHISPER (CPU INT8, Baseline)")
+        print("="*70)
+
+        print("Running FasterWhisper transcription...")
+        transcription, total_time = run_faster_whisper(args.audio_file)
+
+        print(f"✅ Total time: {total_time:.2f}ms (inference only, excludes model loading)")
+        print(f"✅ Transcription: \"{transcription}\"")
+
+        transcriptions['faster_whisper'] = {
+            'text': transcription,
+            'tokens': None,  # FasterWhisper doesn't expose tokens
+            'encoder_time': None,  # No breakdown available
+            'decoder_time': None,
+            'total_time': total_time
+        }
+
+    # -------------------------------------------------------------------------
+    # 5. COMPARISON
     # -------------------------------------------------------------------------
     if len(transcriptions) >= 2:
         print("\n" + "="*70)
@@ -329,15 +467,17 @@ def main():
         labels = {
             'hef': 'HEF (Hailo, 10s, NHWC)',
             'onnx': 'ONNX (CPU, 10s, INT8, NCHW)',
-            'onnx_orig': 'ONNX Original (CPU, 30s, FP32, NCHW)'
+            'onnx_orig': 'ONNX Original (CPU, 30s, FP32, NCHW)',
+            'faster_whisper': 'FasterWhisper (CPU, INT8, Baseline)'
         }
 
         print("\nTiming Summary:")
         for key in sorted(transcriptions.keys()):
             t = transcriptions[key]
             print(f"\n{labels[key]}:")
-            print(f"  Encoder:  {t['encoder_time']:7.2f}ms")
-            print(f"  Decoder:  {t['decoder_time']:7.2f}ms")
+            if t['encoder_time'] is not None:
+                print(f"  Encoder:  {t['encoder_time']:7.2f}ms")
+                print(f"  Decoder:  {t['decoder_time']:7.2f}ms")
             print(f"  Total:    {t['total_time']:7.2f}ms")
 
         print("\n" + "-"*70)
@@ -346,11 +486,12 @@ def main():
             t = transcriptions[key]
             print(f"\n{labels[key]}:")
             print(f"  Text: \"{t['text']}\"")
-            print(f"  Tokens: {t['tokens'][:10]}{'...' if len(t['tokens']) > 10 else ''}")
+            if t['tokens'] is not None:
+                print(f"  Tokens: {t['tokens'][:10]}{'...' if len(t['tokens']) > 10 else ''}")
 
         # Check if transcriptions match
         texts = [t['text'] for t in transcriptions.values()]
-        tokens_list = [tuple(t['tokens']) for t in transcriptions.values()]
+        tokens_list = [tuple(t['tokens']) for t in transcriptions.values() if t['tokens'] is not None]
 
         if len(set(texts)) == 1:
             print(f"\n✅ All transcriptions match: \"{texts[0]}\"")
@@ -359,9 +500,9 @@ def main():
             for key in sorted(transcriptions.keys()):
                 print(f"  {labels[key]:40s} \"{transcriptions[key]['text']}\"")
 
-        if len(set(tokens_list)) == 1:
+        if tokens_list and len(set(tokens_list)) == 1:
             print(f"✅ All token sequences match")
-        else:
+        elif tokens_list and len(set(tokens_list)) > 1:
             print(f"⚠️  Token sequences differ")
 
     print("\n" + "="*70)
