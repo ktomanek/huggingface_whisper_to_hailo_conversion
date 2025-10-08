@@ -1,0 +1,6 @@
+# hailort and tappas through install script
+torch
+librosa
+onnxruntime
+faster_whisper
+transformers

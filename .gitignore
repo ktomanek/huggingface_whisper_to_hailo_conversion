@@ -1,4 +1,5 @@
-hailo_compatible_models/*/*.onnx
-hailo_reference_models/*/*.onnx
 venv
 TODOs.md
+hailo_reference_code
+samples
+models
