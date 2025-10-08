@@ -3,8 +3,14 @@
 
 This to be run on HAILO directly
 
-Standalone Whisper on Hailo Pipeline
+Standalone Whisper on Hailo Pipeline (no external dependencies except transformers, numpy, onnxruntime, librosa, torch, hailo_platform)
 Based on HailoWhisperPipeline from Hailo Application Code Examples
+
+Can run decoder on HEF (no KV-cache, ~70ms/token) or ONNX (with KV-cache, ~6-12ms/token)
+
+Includes time measurements.
+
+
 """
 import numpy as np
 import os

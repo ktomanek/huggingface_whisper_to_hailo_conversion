@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 """
 
-This to be run on HAILO directly
-
-# TODO merge with whisper_encoder_on_hailo.py
-
 Whisper Encoder+Decoder Benchmarking on Hailo
-Compare full transcription outputs across different encoders
+
+Tests end-to-end transcription performance and quality across different encoder implementations
+- different encoders
+- decoding with ONNX decoder with KV-cache and 
+- compare to FasterWhisper baseline (optional)
+
+Overview
+- Purpose: End-to-end transcription comparison across different encoders
+- Components: Any encoder (HEF/ONNX 10s/ONNX 30s) + ONNX decoder with KV-cache
+- Output: Full transcriptions + timing breakdown (encoder/decoder split)
+- Features:
+    - Reuses encoder functions from whisper_encoder_on_hailo.py (line 21-24)
+    - Compares actual transcription text across different encoder implementations
+    - Optional FasterWhisper baseline comparison
+    - Validates if different encoders produce identical transcriptions
+- Use case: End-to-end quality validation - "do all these encoders produce the same text?"
+
+- Decoder integration: Full end-to-end transcription
+  - Transcription validation: Checks if different encoders produce the same text
+  - Token-level output: Actual generated tokens, not just embeddings
+  - FasterWhisper baseline: Optional ground-truth comparison
+
 """
 import numpy as np
 import os
@@ -18,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import everything from whisper_encoder_on_hailo
-from whisper_encoder_on_hailo import (
+from inference.on_hailo.whisper_encoder_on_hailo import (
     get_audio, get_audio_orig_onnx,
     run_hef_encoder, run_onnx_encoder
 )

@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-This to be run on HAILO directly
-
-code with no external dependencies - all included in here
-
 Whisper Encoder Benchmarking on Hailo
 Compare HEF vs ONNX encoder performance on Hailo hardware
+
+Benchmark Whisper Encoder on Hailo hardware vs CPU ONNX Runtime
+
+- Purpose: Encoder-only benchmarking and comparison
+- Components: Encoder only (HEF, ONNX 10s, or ONNX 30s original)
+- Features:
+    - Compare multiple encoder implementations
+    - Performance metrics (min/max/mean/median timing)
+    - Output comparison between encoders
+
+- No decoder, no transcription
+- Output: Encoder features + performance statistics
+
+- Use case: Testing, optimization, validation
+
+
 """
 import numpy as np
 import os
