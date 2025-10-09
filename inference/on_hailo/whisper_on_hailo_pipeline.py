@@ -221,7 +221,7 @@ class HailoWhisperPipeline:
 
     def __init__(self, encoder_hef_path: str = None, decoder_hef_path: str = None, variant="tiny",
                  decoder_assets_path=None, multi_process_service=False, decoder_onnx_dir=None,
-                 encoder_onnx_path: str = None, encoder_is_orig_onnx: bool = False):
+                 encoder_onnx_path: str = None, encoder_is_orig_onnx: bool = False, debug: bool = False):
         """
         Initialize the pipeline.
 
@@ -234,9 +234,12 @@ class HailoWhisperPipeline:
         :param multi_process_service: Enable multi-process service mode (HEF only).
         :param decoder_onnx_dir: Path to directory containing ONNX decoder files (decoder_model.onnx and decoder_with_past_model.onnx).
                                  If provided, uses ONNX decoder instead of HEF decoder.
+        :param debug: Enable debug output for warmup messages.
         """
         import psutil
         process = psutil.Process(os.getpid())
+
+        self.debug = debug
 
         self.encoder_hef_path = encoder_hef_path
         self.encoder_onnx_path = encoder_onnx_path
@@ -281,15 +284,25 @@ class HailoWhisperPipeline:
             encoder_memory = (mem_after_encoder - mem_before_encoder) / (1024 * 1024)
             print(f"[INFO] Encoder memory usage: {encoder_memory:.2f} MB")
 
-            # Warmup ONNX encoder
-            print(f"[INFO] Warming up ONNX encoder...")
+            # Warmup ONNX encoder (3 iterations)
+            if self.debug:
+                print(f"[INFO] Warming up ONNX encoder (3 iterations)...")
             if self.encoder_is_orig_onnx:
                 dummy_input = np.random.randn(1, 80, 3000).astype(np.float32)
             else:
                 dummy_input = np.random.randn(1, 80, 1, 1000).astype(np.float32)
             input_name = self.encoder_session.get_inputs()[0].name
-            _ = self.encoder_session.run(None, {input_name: dummy_input})
-            print(f"[INFO] ONNX encoder warmup complete")
+            for _ in range(3):
+                _ = self.encoder_session.run(None, {input_name: dummy_input})
+            if self.debug:
+                print(f"[INFO] ONNX encoder warmup complete")
+
+            # Measure memory after warmup
+            mem_after_encoder_warmup = process.memory_info().rss
+            encoder_warmup_overhead = (mem_after_encoder_warmup - mem_after_encoder) / (1024 * 1024)
+            encoder_total_memory = encoder_memory + encoder_warmup_overhead
+            print(f"[INFO] Encoder warmup overhead: {encoder_warmup_overhead:.2f} MB")
+            print(f"[INFO] Encoder total memory (after warmup): {encoder_total_memory:.2f} MB")
             # No VDevice needed for ONNX encoder
         else:
             # HEF encoder mode - initialize VDevice and Hailo resources
@@ -318,15 +331,25 @@ class HailoWhisperPipeline:
             encoder_memory = (mem_after_encoder - mem_before_encoder) / (1024 * 1024)
             print(f"[INFO] Encoder memory usage: {encoder_memory:.2f} MB")
 
-            # Warmup HEF encoder
-            print(f"[INFO] Warming up HEF encoder...")
+            # Warmup HEF encoder (3 iterations)
+            if self.debug:
+                print(f"[INFO] Warming up HEF encoder (3 iterations)...")
             dummy_input = np.random.randn(1, 1, 1000, 80).astype(np.float32)
             dummy_input_contiguous = np.ascontiguousarray(dummy_input)
-            self.encoder_bindings.input().set_buffer(dummy_input_contiguous)
             buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
-            self.encoder_bindings.output().set_buffer(buffer)
-            self.encoder_configured_infer_model.run([self.encoder_bindings], self.timeout_ms)
-            print(f"[INFO] HEF encoder warmup complete")
+            for _ in range(3):
+                self.encoder_bindings.input().set_buffer(dummy_input_contiguous)
+                self.encoder_bindings.output().set_buffer(buffer)
+                self.encoder_configured_infer_model.run([self.encoder_bindings], self.timeout_ms)
+            if self.debug:
+                print(f"[INFO] HEF encoder warmup complete")
+
+            # Measure memory after warmup
+            mem_after_encoder_warmup = process.memory_info().rss
+            encoder_warmup_overhead = (mem_after_encoder_warmup - mem_after_encoder) / (1024 * 1024)
+            encoder_total_memory = encoder_memory + encoder_warmup_overhead
+            print(f"[INFO] Encoder warmup overhead: {encoder_warmup_overhead:.2f} MB")
+            print(f"[INFO] Encoder total memory (after warmup): {encoder_total_memory:.2f} MB")
 
         if self.use_onnx_decoder:
             # ONNX decoder mode - no token embeddings needed
@@ -351,15 +374,25 @@ class HailoWhisperPipeline:
             decoder_memory = (mem_after_decoder - mem_before_decoder) / (1024 * 1024)
             print(f"[INFO] Decoder memory usage: {decoder_memory:.2f} MB")
 
-            # Warmup ONNX decoder
-            print(f"[INFO] Warming up ONNX decoder...")
+            # Warmup ONNX decoder (3 iterations)
+            if self.debug:
+                print(f"[INFO] Warming up ONNX decoder (3 iterations)...")
             dummy_encoder_output = np.random.randn(1, 500, 384).astype(np.float32)
             dummy_input_ids = np.array([[50258, 50259, 50359, 50363]], dtype=np.int64)
-            _ = self.decoder_init_session.run(None, {
-                'input_ids': dummy_input_ids,
-                'encoder_hidden_states': dummy_encoder_output
-            })
-            print(f"[INFO] ONNX decoder warmup complete")
+            for _ in range(3):
+                _ = self.decoder_init_session.run(None, {
+                    'input_ids': dummy_input_ids,
+                    'encoder_hidden_states': dummy_encoder_output
+                })
+            if self.debug:
+                print(f"[INFO] ONNX decoder warmup complete")
+
+            # Measure memory after warmup
+            mem_after_decoder_warmup = process.memory_info().rss
+            decoder_warmup_overhead = (mem_after_decoder_warmup - mem_after_decoder) / (1024 * 1024)
+            decoder_total_memory = decoder_memory + decoder_warmup_overhead
+            print(f"[INFO] Decoder warmup overhead: {decoder_warmup_overhead:.2f} MB")
+            print(f"[INFO] Decoder total memory (after warmup): {decoder_total_memory:.2f} MB")
         else:
             # HEF decoder mode - need token embeddings
             print(f"[INFO] Using HEF decoder")
@@ -412,8 +445,9 @@ class HailoWhisperPipeline:
             total_decoder_memory = embeddings_memory + decoder_hef_memory
             print(f"[INFO] Total decoder memory usage: {total_decoder_memory:.2f} MB")
 
-            # Warmup HEF decoder
-            print(f"[INFO] Warming up HEF decoder...")
+            # Warmup HEF decoder (3 iterations)
+            if self.debug:
+                print(f"[INFO] Warming up HEF decoder (3 iterations)...")
             dummy_encoder_output = np.random.randn(1, 500, 384).astype(np.float32)
             dummy_decoder_input_ids = np.array([[50258, 50259, 50359, 50363]], dtype=np.int64)
             dummy_decoder_input_ids = np.concatenate(
@@ -421,16 +455,26 @@ class HailoWhisperPipeline:
             )
             tokenized_ids = self._tokenization(dummy_decoder_input_ids)
 
-            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer1").set_buffer(dummy_encoder_output)
-            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer2").set_buffer(tokenized_ids)
             buffers = [
                 np.zeros(self.decoder_infer_model.output(name).shape).astype(np.float32)
                 for name in self.decoder_sorted_output_names
             ]
-            for name, buffer in zip(self.decoder_sorted_output_names, buffers):
-                self.decoder_bindings.output(name).set_buffer(buffer)
-            self.decoder_configured_infer_model.run([self.decoder_bindings], self.timeout_ms)
-            print(f"[INFO] HEF decoder warmup complete")
+
+            for _ in range(3):
+                self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer1").set_buffer(dummy_encoder_output)
+                self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer2").set_buffer(tokenized_ids)
+                for name, buffer in zip(self.decoder_sorted_output_names, buffers):
+                    self.decoder_bindings.output(name).set_buffer(buffer)
+                self.decoder_configured_infer_model.run([self.decoder_bindings], self.timeout_ms)
+            if self.debug:
+                print(f"[INFO] HEF decoder warmup complete")
+
+            # Measure memory after warmup
+            mem_after_decoder_warmup = process.memory_info().rss
+            decoder_warmup_overhead = (mem_after_decoder_warmup - mem_after_decoder_hef) / (1024 * 1024)
+            decoder_total_memory = total_decoder_memory + decoder_warmup_overhead
+            print(f"[INFO] Decoder warmup overhead: {decoder_warmup_overhead:.2f} MB")
+            print(f"[INFO] Decoder total memory (after warmup): {decoder_total_memory:.2f} MB")
 
     def _load_token_embedding_weight(self):
         """
@@ -1007,7 +1051,8 @@ def main():
         variant=args.variant,
         decoder_assets_path=args.decoder_assets_path,
         multi_process_service=args.multi_process_service,
-        decoder_onnx_dir=args.decoder_onnx_dir
+        decoder_onnx_dir=args.decoder_onnx_dir,
+        debug=args.debug
     )
 
     print("Pipeline initialized successfully!")

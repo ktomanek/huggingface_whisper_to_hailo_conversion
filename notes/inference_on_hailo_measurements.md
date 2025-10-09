@@ -35,6 +35,16 @@ Total times (ms):
   Min/Max: 329.2 / 331.0
   Median: 329.6
 
+memory:
+[INFO] Encoder memory usage: 24.89 MB
+[INFO] Encoder warmup overhead: 0.50 MB
+[INFO] Encoder total memory (after warmup): 25.39 MB
+[INFO] Token embeddings memory usage: 76.00 MB
+[INFO] HEF decoder model memory usage: 128.44 MB
+[INFO] Total decoder memory usage: 204.44 MB
+[INFO] Decoder warmup overhead: 8.72 MB
+[INFO] Decoder total memory (after warmup): 213.16 MB
+
 
 python inference/on_hailo/whisper_on_hailo_pipeline.py \
     --encoder_hef_file models/hef/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef \
@@ -105,6 +115,14 @@ Total times (ms):
   Min/Max: 62.1 / 69.2
   Median: 63.0
 
+memory:
+[INFO] Encoder memory usage: 24.89 MB
+[INFO] Encoder warmup overhead: 0.50 MB
+[INFO] Encoder total memory (after warmup): 25.39 MB
+[INFO] Decoder memory usage: 239.67 MB
+[INFO] Decoder warmup overhead: 1.52 MB
+[INFO] Decoder total memory (after warmup): 241.19 MB
+
 python inference/on_hailo/whisper_on_hailo_pipeline.py \
     --encoder_hef_file models/hef/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef \
     --decoder_onnx_dir models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default_int8 \
@@ -174,6 +192,14 @@ Total times (ms):
   Min/Max: 164.1 / 177.6
   Median: 170.7
 
+memory:
+[INFO] Encoder memory usage: 42.81 MB
+[INFO] Encoder warmup overhead: 36.50 MB
+[INFO] Encoder total memory (after warmup): 79.31 MB
+[INFO] Decoder memory usage: 251.31 MB
+[INFO] Decoder warmup overhead: 0.50 MB
+[INFO] Decoder total memory (after warmup): 251.81 MB
+
 python inference/on_hailo/whisper_on_hailo_pipeline.py \
 --encoder_onnx_file models/onnx/hailo_compatible_models/hf_whisper_tiny/whisper_tiny_encoder_10s_hailo_final.onnx \
 --decoder_onnx_dir models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default_int8 \
@@ -242,6 +268,29 @@ Total times (ms):
   Mean: 503.6 ± 3.3
   Min/Max: 496.7 / 507.3
   Median: 503.8
+
+memory:
+[INFO] Encoder memory usage: 16.23 MB
+[INFO] Encoder warmup overhead: 79.03 MB
+[INFO] Encoder total memory (after warmup): 95.27 MB
+[INFO] Decoder memory usage: 252.95 MB
+[INFO] Decoder warmup overhead: 0.50 MB
+[INFO] Decoder total memory (after warmup): 253.45 MB
+
+
+python inference/on_hailo/whisper_on_hailo_pipeline.py \
+    --encoder_orig_onnx_file models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default/encoder_model.onnx \
+    --decoder_onnx_dir models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default \
+    --audio_file samples/singles/hello_world.wav
+
+memory
+[INFO] Encoder memory usage: 39.73 MB
+[INFO] Encoder warmup overhead: 236.00 MB
+[INFO] Encoder total memory (after warmup): 275.73 MB
+[INFO] Using ONNX decoder from: models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default
+[INFO] Decoder memory usage: 387.91 MB
+[INFO] Decoder warmup overhead: 8.50 MB
+[INFO] Decoder total memory (after warmup): 396.41 MB
 
 python inference/on_hailo/whisper_on_hailo_pipeline.py \
     --encoder_orig_onnx_file models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default_int8/encoder_model.onnx \
@@ -381,6 +430,16 @@ python inference/on_hailo/faster_whisper_baseline.py --audio_folder samples/libr
     Avg Inference:       1067.4ms
     Avg Total time:      1076.6ms
 
+# Moonshine
+
+python inference/on_hailo/moonshine_baseline.py --audio_folder samples/librispeech_devclean_small/prepared
+
+  Samples processed:     24/24
+  Average WER:           29.29%
+  Average CER:           9.97%
+
+  Timing:
+    Avg Inference time:  279.1ms
 
 ## Results Summary Tables
 
@@ -421,3 +480,130 @@ python inference/on_hailo/faster_whisper_baseline.py --audio_folder samples/libr
 - **HEF decoder**: Comparable to ONNX decoder (57.92% vs 54.33% WER) after repetition penalty fix
 - **Decoder quantization**: INT8 decoder improves WER vs FP32 when paired with FP32 encoder (30.82% → 27.71%)
 - **Encoder quantization is critical**: INT8 encoder causes major degradation (27.71% → 58.59% WER)
+
+
+
+
+# Memory Usage Analysis
+
+## Memory Usage Summary Table
+
+| Configuration | Encoder Memory (MB) | Encoder Total (after warmup) (MB) | Decoder Memory (MB) | Decoder Total (after warmup) (MB) | Total Memory (MB) |
+|--------------|---------------------|-----------------------------------|---------------------|-----------------------------------|-------------------|
+| **HEF Encoder + HEF Decoder** | 24.89 | 25.39 | 204.44 | 213.16 | 238.55 |
+| **HEF Encoder + ONNX Decoder (INT8)** | 24.89 | 25.39 | 239.67 | 241.19 | 266.58 |
+| **ONNX Encoder (10s) + ONNX Decoder (INT8)** | 42.81 | 79.31 | 251.31 | 251.81 | 331.12 |
+| **ONNX Encoder (30s, INT8) + ONNX Decoder (INT8)** | 16.23 | 95.27 | 252.95 | 253.45 | 348.72 |
+| **ONNX Encoder (30s, FP32) + ONNX Decoder (FP32)** | 39.73 | 275.73 | 387.91 | 396.41 | 672.14 |
+
+**Key Findings:**
+- **Lowest memory**: HEF Encoder + HEF Decoder (238.55 MB total)
+- **Highest memory**: ONNX 30s FP32 + ONNX FP32 Decoder (672.14 MB total) - **2.8x more than HEF**
+- **HEF encoder advantage**: 24.89 MB vs 42.81 MB (10s ONNX) or 39.73 MB + 236 MB warmup (30s FP32 ONNX)
+- **HEF decoder includes**: 76 MB token embeddings + 128.44 MB model/buffers = 204.44 MB
+- **Warmup overhead**: HEF minimal (0.5-8.7 MB), ONNX encoder significant (36.5-236 MB)
+- **ONNX encoder warmup**: Large overhead due to JIT compilation, graph optimization, and kernel selection
+- **FP32 vs INT8**: FP32 ONNX uses **~2x more memory** (672 MB vs 349 MB) with massive warmup (236 MB vs 79 MB)
+
+**Note:** Decoder memory for HEF includes token embeddings (76 MB) stored in CPU RAM, even though neural network runs on NPU.
+
+---
+
+## Memory Breakdown (with 3x warmup)
+
+### HEF Setup (Hailo NPU Hardware)
+
+```
+[INFO] Encoder memory usage: 24.89 MB
+[INFO] Encoder warmup overhead: 0.50 MB
+[INFO] Encoder total memory (after warmup): 25.39 MB
+
+[INFO] Token embeddings memory usage: 76.00 MB
+[INFO] HEF decoder model memory usage: 128.50 MB
+[INFO] Total decoder memory usage: 204.50 MB
+[INFO] Decoder warmup overhead: 7.12 MB
+[INFO] Decoder total memory (after warmup): 211.62 MB
+```
+
+**Total HEF Memory: ~237 MB** (25.39 + 211.62)
+
+**Analysis:**
+- ✅ Encoder warmup overhead: **0.50 MB** - negligible, likely just Python GC noise
+- ⚠️ Decoder warmup overhead: **7.12 MB** - some lazy buffer allocation during warmup
+- Token embeddings (76 MB) required even for HEF decoder (stored in CPU RAM)
+- HEF decoder model (128.50 MB) includes pre-allocated DMA buffers and host-side structures
+
+---
+
+### ONNX Setup (CPU)
+
+```
+[INFO] Encoder memory usage: 16.73 MB
+[INFO] Encoder warmup overhead: 81.53 MB
+[INFO] Encoder total memory (after warmup): 98.27 MB
+
+[INFO] Decoder memory usage: 250.56 MB
+[INFO] Decoder warmup overhead: 0.50 MB
+[INFO] Decoder total memory (after warmup): 251.06 MB
+```
+
+**Total ONNX Memory: ~349 MB** (98.27 + 251.06)
+
+**Analysis:**
+- ⚠️ **Encoder warmup overhead: 81.53 MB** - Significant! ONNX Runtime performs:
+  - JIT compilation and graph optimization
+  - Memory pool allocation
+  - Arena allocation for intermediate tensors
+  - Operator kernel selection and tuning
+- ✅ Decoder warmup overhead: **0.50 MB** - minimal, decoder pre-allocated properly
+- ONNX decoder includes token embeddings in model weights (250.56 MB total)
+
+---
+
+## Why HEF Has Less Warmup Overhead
+
+**HEF (Hailo Executable Format)** is a **pre-compiled, hardware-specific binary**:
+- ✅ **Pre-compiled offline** by Hailo's compiler for the NPU
+- ✅ **No runtime optimization needed** - all graph optimization, layer fusion, quantization already done
+- ✅ **Fixed execution plan** - no kernel selection or graph building at runtime
+- ✅ **Minimal host-side work** - only DMA buffer setup and NPU communication
+
+**ONNX (Runtime compilation/optimization)**:
+- ⚠️ **Generic format** - needs runtime adaptation
+- ⚠️ **Heavy warmup work**: graph optimization, memory planning, kernel selection, JIT compilation
+- ⚠️ **Large memory overhead** (~81 MB for encoder) allocated during first few inferences
+
+| | **HEF** | **ONNX** |
+|---|---|---|
+| Optimization | **Offline** (pre-compiled) | **Runtime** (JIT) |
+| Hardware | **Specific** (Hailo NPU) | **Generic** (Any CPU) |
+| Warmup work | Minimal buffer setup | Graph optimization + kernel selection |
+| Memory overhead | Small (~7 MB) | Large (~81 MB) |
+
+**Conclusion:** HEF is like a native binary (`.exe`), while ONNX is like bytecode that needs JIT compilation. HEF's lower overhead is a **key advantage of hardware-accelerated inference** - you pay the compilation cost once during model conversion, not at runtime! 🚀
+
+---
+
+# Measurement of captioning
+
+## Hybrid Hailo
+
+Model uses 283.91 MB of RAM
+Number of inference calls total: 45
+Number of partial segments transcribed: 38
+Number of full segments transcribed: 7
+Number of frames transcribed: 1009856
+Total speech time transcribed: 63.12 sec
+Total inference time: 4.49 sec
+Inverse real-time factor (RTFx): 14.05
+
+## Moonshine
+
+Model uses 320.33 MB of RAM
+Number of inference calls total: 75
+Number of partial segments transcribed: 68
+Number of full segments transcribed: 7
+Number of frames transcribed: 1074368
+Total speech time transcribed: 67.15 sec
+Total inference time: 4.72 sec
+Inverse real-time factor (RTFx): 14.21
