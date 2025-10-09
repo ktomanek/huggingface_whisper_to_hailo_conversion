@@ -251,6 +251,10 @@ class HailoWhisperPipeline:
         self.encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
         self.encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
 
+        # Configure encoder once and create bindings (reduce overhead)
+        self.encoder_configured_infer_model = self.encoder_infer_model.configure()
+        self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
+
         if self.use_onnx_decoder:
             # ONNX decoder mode - no token embeddings needed
             print(f"[INFO] Using ONNX decoder from: {decoder_onnx_dir}")
@@ -291,6 +295,10 @@ class HailoWhisperPipeline:
             self.decoder_infer_model.input(f"{self.decoder_model_name}/input_layer2").set_format_type(FormatType.FLOAT32)
             for output_name in self.decoder_sorted_output_names:
                 self.decoder_infer_model.output(output_name).set_format_type(FormatType.FLOAT32)
+
+            # Configure decoder once and create bindings (reduce overhead)
+            self.decoder_configured_infer_model = self.decoder_infer_model.configure()
+            self.decoder_bindings = self.decoder_configured_infer_model.create_bindings()
 
     def _load_token_embedding_weight(self):
         """
@@ -358,23 +366,21 @@ class HailoWhisperPipeline:
 
 
     def _run_encoder_hef(self, input_mel_spec, debug=False):
-        """Run encoder inference using pre-loaded HEF model."""
+        """Run encoder inference using pre-configured bindings."""
         encoder_start_total = time.time()
         input_mel = np.ascontiguousarray(input_mel_spec)
 
-        with self.encoder_infer_model.configure() as encoder_configured_infer_model:
-            encoder_bindings = encoder_configured_infer_model.create_bindings()
+        # Reuse pre-configured bindings
+        self.encoder_bindings.input().set_buffer(input_mel)
+        buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
+        self.encoder_bindings.output().set_buffer(buffer)
 
-            encoder_bindings.input().set_buffer(input_mel)
-            buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
-            encoder_bindings.output().set_buffer(buffer)
+        # Measure actual inference time
+        inference_start = time.time()
+        self.encoder_configured_infer_model.run([self.encoder_bindings], self.timeout_ms)
+        inference_time_ms = (time.time() - inference_start) * 1000
 
-            # Measure actual inference time
-            inference_start = time.time()
-            encoder_configured_infer_model.run([encoder_bindings], self.timeout_ms)
-            inference_time_ms = (time.time() - inference_start) * 1000
-
-            encoded_features = encoder_bindings.output().get_buffer().copy()
+        encoded_features = self.encoder_bindings.output().get_buffer().copy()
 
         encoder_time_ms = (time.time() - encoder_start_total) * 1000
 
@@ -407,57 +413,55 @@ class HailoWhisperPipeline:
             print(f"[DEBUG] Decoder input IDs initialized: {decoder_input_ids[0][:8]}")
             print(f"[DEBUG] Starting decoder with {self.decoding_sequence_length} max tokens")
 
-        with self.decoder_infer_model.configure() as decoder_configured_infer_model:
-            decoder_bindings = decoder_configured_infer_model.create_bindings()
+        # Reuse pre-configured bindings
+        # Run Decoder Iteratively
+        inference_times = []  # Track pure inference times
+        for i in range(self.decoding_sequence_length - 1):
+            step_start = time.time()
 
-            # Run Decoder Iteratively
-            inference_times = []  # Track pure inference times
-            for i in range(self.decoding_sequence_length - 1):
-                step_start = time.time()
+            tokenized_ids = self._tokenization(decoder_input_ids)
 
-                tokenized_ids = self._tokenization(decoder_input_ids)
+            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer1").set_buffer(encoded_features)
+            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer2").set_buffer(tokenized_ids)
 
-                decoder_bindings.input(f"{self.decoder_model_name}/input_layer1").set_buffer(encoded_features)
-                decoder_bindings.input(f"{self.decoder_model_name}/input_layer2").set_buffer(tokenized_ids)
+            buffers = [
+                np.zeros(self.decoder_infer_model.output(name).shape).astype(np.float32)
+                for name in self.decoder_sorted_output_names
+            ]
 
-                buffers = [
-                    np.zeros(self.decoder_infer_model.output(name).shape).astype(np.float32)
-                    for name in self.decoder_sorted_output_names
-                ]
+            for name, buffer in zip(self.decoder_sorted_output_names, buffers):
+                self.decoder_bindings.output(name).set_buffer(buffer)
 
-                for name, buffer in zip(self.decoder_sorted_output_names, buffers):
-                    decoder_bindings.output(name).set_buffer(buffer)
+            # Measure actual inference time
+            inference_start = time.time()
+            self.decoder_configured_infer_model.run([self.decoder_bindings], self.timeout_ms)
+            inference_time_ms = (time.time() - inference_start) * 1000
+            inference_times.append(inference_time_ms)
 
-                # Measure actual inference time
-                inference_start = time.time()
-                decoder_configured_infer_model.run([decoder_bindings], self.timeout_ms)
-                inference_time_ms = (time.time() - inference_start) * 1000
-                inference_times.append(inference_time_ms)
+            decoder_outputs = np.concatenate(
+                [self.decoder_bindings.output(name).get_buffer() for name in self.decoder_sorted_output_names], axis=2
+            )
 
-                decoder_outputs = np.concatenate(
-                    [decoder_bindings.output(name).get_buffer() for name in self.decoder_sorted_output_names], axis=2
-                )
+            # Decoder post-processing
+            logits = _apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=REPETITION_PENALTY)
+            next_token = np.argmax(logits)
 
-                # Decoder post-processing
-                logits = _apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=REPETITION_PENALTY)
-                next_token = np.argmax(logits)
+            step_time_ms = (time.time() - step_start) * 1000
+            token_times.append(step_time_ms)
 
-                step_time_ms = (time.time() - step_start) * 1000
-                token_times.append(step_time_ms)
+            generated_tokens.append(next_token)
+            decoder_input_ids[0][i + 1] = np.array([[next_token]], dtype=np.int64)
 
-                generated_tokens.append(next_token)
-                decoder_input_ids[0][i + 1] = np.array([[next_token]], dtype=np.int64)
+            # Debug: Show token generation with timing
+            if debug:
+                token_text = self.tokenizer.decode([next_token]) if next_token < len(self.tokenizer) else f"<{next_token}>"
+                top_3_tokens = np.argsort(decoder_outputs[:, i].flatten())[-3:][::-1]
+                print(f"[TIMING] Step {i}: {step_time_ms:.1f}ms | token={next_token} '{token_text}' | top-3: {top_3_tokens}")
 
-                # Debug: Show token generation with timing
+            if next_token == self.tokenizer.eos_token_id:
                 if debug:
-                    token_text = self.tokenizer.decode([next_token]) if next_token < len(self.tokenizer) else f"<{next_token}>"
-                    top_3_tokens = np.argsort(decoder_outputs[:, i].flatten())[-3:][::-1]
-                    print(f"[TIMING] Step {i}: {step_time_ms:.1f}ms | token={next_token} '{token_text}' | top-3: {top_3_tokens}")
-
-                if next_token == self.tokenizer.eos_token_id:
-                    if debug:
-                        print(f"[DEBUG] EOS token {self.tokenizer.eos_token_id} reached at step {i}")
-                    break
+                    print(f"[DEBUG] EOS token {self.tokenizer.eos_token_id} reached at step {i}")
+                break
 
         # Convert token IDs to text
         transcription = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
