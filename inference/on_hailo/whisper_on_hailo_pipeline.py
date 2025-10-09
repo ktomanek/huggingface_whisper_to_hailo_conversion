@@ -103,7 +103,7 @@ def _pad_or_trim(array, length: int = N_SAMPLES_10S, *, axis: int = -1):
     return array
 
 
-def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0):
+def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0, sample_rate: int = None):
     """
     Compute log-Mel spectrogram using PyTorch STFT (Hailo-efficient approach).
 
@@ -111,10 +111,14 @@ def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0
         audio: Audio waveform tensor at 16kHz
         n_mels: Number of mel frequency bands (default: 80)
         padding: Zero samples to pad
+        sample_rate: Sample rate in Hz (default: SAMPLE_RATE constant)
 
     Returns:
         log_spec: Log-mel spectrogram [n_mels, n_frames]
     """
+    if sample_rate is None:
+        sample_rate = SAMPLE_RATE
+
     if padding > 0:
         audio = torch.nn.functional.pad(audio, (0, padding))
 
@@ -125,14 +129,14 @@ def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0
     # Compute mel filters on-the-fly using librosa (cached by lru_cache)
     from functools import lru_cache
 
-    @lru_cache(maxsize=1)
-    def get_mel_filters(device_str, n_mels):
+    @lru_cache(maxsize=4)
+    def get_mel_filters(device_str, n_mels, sr):
         """Cached mel filter computation."""
         import librosa
-        mel_basis = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=N_FFT, n_mels=n_mels)
         return torch.from_numpy(mel_basis).to(device_str)
 
-    filters = get_mel_filters(str(audio.device), n_mels)
+    filters = get_mel_filters(str(audio.device), n_mels, sample_rate)
     mel_spec = filters @ magnitudes
 
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
@@ -142,7 +146,7 @@ def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0
     return log_spec
 
 
-def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0, format_4d=True, is_nhwc=True):
+def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0, format_4d=True, is_nhwc=True, sample_rate=None):
     """
     Load audio file and convert to mel spectrogram (configurable for different encoder types).
 
@@ -153,6 +157,7 @@ def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0
                              (default: 1.0, e.g., crop to 9s for 10s target to leave natural padding)
         format_4d: If True, output 4D tensor [1, 80, 1, N]. If False, output 3D tensor [1, 80, N]
         is_nhwc: Whether to transpose to NHWC format (only applies if format_4d=True)
+        sample_rate: Target sample rate in Hz (default: SAMPLE_RATE constant = 16000)
 
     Returns:
         mel_spectrogram: Numpy array
@@ -160,11 +165,14 @@ def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0
             - format_4d=True, is_nhwc=False: [1, 80, 1, N] (ONNX 10s)
             - format_4d=False: [1, 80, N] (ONNX 30s)
     """
+    if sample_rate is None:
+        sample_rate = SAMPLE_RATE
+
     # Load audio using librosa
-    audio, sr = librosa.load(audio_file, sr=SAMPLE_RATE, mono=True)
+    audio, sr = librosa.load(audio_file, sr=sample_rate, mono=True)
 
     # Check duration
-    audio_duration = len(audio) / SAMPLE_RATE
+    audio_duration = len(audio) / sample_rate
     crop_duration = target_duration - padding_cutoff_delta
 
     if audio_duration > crop_duration:
@@ -176,15 +184,15 @@ def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0
     # Crop audio first (e.g., 9s for 10s target), then pad to target_duration
     # This avoids hallucinations from hard cutoffs at exactly the boundary
     if padding_cutoff_delta > 0:
-        crop_samples = int(crop_duration * SAMPLE_RATE)
+        crop_samples = int(crop_duration * sample_rate)
         audio_torch = _pad_or_trim(audio_torch, crop_samples)
 
     # Pad to target duration
-    target_samples = int(target_duration * SAMPLE_RATE)
+    target_samples = int(target_duration * sample_rate)
     audio_torch = _pad_or_trim(audio_torch, target_samples)
 
     # Compute mel spectrogram using efficient PyTorch STFT
-    mel = _log_mel_spectrogram(audio_torch).to("cpu")
+    mel = _log_mel_spectrogram(audio_torch, sample_rate=sample_rate).to("cpu")
 
     # Convert to numpy and add batch dimension
     mel = mel.numpy()

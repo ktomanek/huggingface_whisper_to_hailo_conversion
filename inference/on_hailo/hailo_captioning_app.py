@@ -33,100 +33,60 @@ import librosa
 # Embedded dependencies
 from silero_vad import VADIterator, load_silero_vad
 
+# Import shared helper functions from whisper_on_hailo_pipeline
+from whisper_on_hailo_pipeline import (
+    _pad_or_trim,
+    _log_mel_spectrogram,
+    N_FFT,
+    HOP_LENGTH,
+    SAMPLE_RATE as SAMPLING_RATE,
+    REPETITION_PENALTY
+)
+
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants
 DEFAULT_LANGUAGE = 'en'
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SAMPLING_RATE = 16000
 AUDIO_FRAMES_TO_CAPTURE = 512  # VAD strictly needs this number
 VAD_THRESHOLD = 0.5
 EOS_MIN_SILENCE = 100
 MAXIMUM_SEGMENT_DURATION = 9.0 #because of 10sec encoder max (where 1sec padding helps to avoid hallucinations)
 
-# Whisper audio preprocessing constants
-N_FFT = 400
-HOP_LENGTH = 160
-REPETITION_PENALTY = 1.5
 
-
-def _pad_or_trim(array, length: int, *, axis: int = -1):
-    """Pad or trim the audio array to specified length."""
-    if torch.is_tensor(array):
-        if array.shape[axis] > length:
-            array = array.index_select(
-                dim=axis, index=torch.arange(length, device=array.device)
-            )
-        if array.shape[axis] < length:
-            pad_widths = [(0, 0)] * array.ndim
-            pad_widths[axis] = (0, length - array.shape[axis])
-            array = torch.nn.functional.pad(array, [pad for sizes in pad_widths[::-1] for pad in sizes])
-    else:
-        if array.shape[axis] > length:
-            array = array.take(indices=range(length), axis=axis)
-        if array.shape[axis] < length:
-            pad_widths = [(0, 0)] * array.ndim
-            pad_widths[axis] = (0, length - array.shape[axis])
-            array = np.pad(array, pad_widths)
-    return array
-
-
-def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0):
-    """Compute log-Mel spectrogram using PyTorch STFT."""
-    if padding > 0:
-        audio = torch.nn.functional.pad(audio, (0, padding))
-
-    window = torch.hann_window(N_FFT).to(audio.device)
-    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-    magnitudes = stft[..., :-1].abs() ** 2
-
-    # Compute mel filters on-the-fly using librosa (cached by lru_cache)
-    from functools import lru_cache
-
-    @lru_cache(maxsize=1)
-    def get_mel_filters(device_str, n_mels):
-        """Cached mel filter computation."""
-        mel_basis = librosa.filters.mel(sr=SAMPLING_RATE, n_fft=N_FFT, n_mels=n_mels)
-        return torch.from_numpy(mel_basis).to(device_str)
-
-    filters = get_mel_filters(str(audio.device), n_mels)
-    mel_spec = filters @ magnitudes
-
-    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-
-    return log_spec
-
-
-def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0):
+def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0, sample_rate=None):
     """
-    Convert audio to mel spectrogram for Hailo HEF encoder (NHWC format).
+    Convert audio data (numpy array) to mel spectrogram for Hailo HEF encoder (NHWC format).
+    Uses shared helper functions from whisper_on_hailo_pipeline.
 
     Args:
         audio_data: Audio waveform (numpy array)
         target_duration: Target duration in seconds (default: 10)
         padding_cutoff_delta: Time to cut off before target to avoid hallucinations (default: 1.0)
+        sample_rate: Sample rate in Hz (default: SAMPLING_RATE constant = 16000)
 
     Returns:
         mel_spectrogram: [1, 1, N, 80] (NHWC format for HEF)
     """
+    if sample_rate is None:
+        sample_rate = SAMPLING_RATE
+
     # Convert to torch tensor
     audio_torch = torch.from_numpy(audio_data)
 
     # Crop audio first, then pad to target duration
     crop_duration = target_duration - padding_cutoff_delta
     if padding_cutoff_delta > 0:
-        crop_samples = int(crop_duration * SAMPLING_RATE)
+        crop_samples = int(crop_duration * sample_rate)
         audio_torch = _pad_or_trim(audio_torch, crop_samples)
 
     # Pad to target duration
-    target_samples = int(target_duration * SAMPLING_RATE)
+    target_samples = int(target_duration * sample_rate)
     audio_torch = _pad_or_trim(audio_torch, target_samples)
 
-    # Compute mel spectrogram
-    mel = _log_mel_spectrogram(audio_torch).to("cpu")
+    # Compute mel spectrogram using shared function
+    mel = _log_mel_spectrogram(audio_torch, sample_rate=sample_rate).to("cpu")
 
     # Convert to numpy and reshape to NHWC [1, 1, N, 80]
     mel = mel.numpy()
