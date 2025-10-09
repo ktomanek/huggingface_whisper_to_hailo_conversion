@@ -163,51 +163,62 @@ def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0
     return log_spec
 
 
-def get_mel_spectrogram(audio_file, max_chunk_length=9, is_nhwc=True):
+def get_mel_spectrogram(audio_file, target_duration=10, padding_cutoff_delta=1.0, format_4d=True, is_nhwc=True):
     """
-    Load audio file and convert to mel spectrogram (Hailo-efficient implementation).
+    Load audio file and convert to mel spectrogram (configurable for different encoder types).
 
     Args:
         audio_file: Path to audio file
-        chunk_length: Duration in seconds (default: 9.5s to avoid boundary hallucinations.
-                     Using exactly 10s can cause Whisper to hallucinate due to hard cutoffs
-                     at the model's training boundary. Reducing to 9.5s leaves natural padding.)
-        is_nhwc: Whether to transpose to NHWC format (default: True for Hailo models)
+        target_duration: Target duration in seconds for encoder (10 for 10s encoders, 30 for 30s encoders)
+        padding_cutoff_delta: Time (in seconds) to cut off before target_duration to avoid boundary hallucinations
+                             (default: 1.0, e.g., crop to 9s for 10s target to leave natural padding)
+        format_4d: If True, output 4D tensor [1, 80, 1, N]. If False, output 3D tensor [1, 80, N]
+        is_nhwc: Whether to transpose to NHWC format (only applies if format_4d=True)
 
     Returns:
-        mel_spectrogram: Numpy array [1, 80, 1, 1000] (NCHW) or [1, 1, 1000, 80] (NHWC)
+        mel_spectrogram: Numpy array
+            - format_4d=True, is_nhwc=True:  [1, 1, N, 80] (HEF 10s)
+            - format_4d=True, is_nhwc=False: [1, 80, 1, N] (ONNX 10s)
+            - format_4d=False: [1, 80, N] (ONNX 30s)
     """
     # Load audio using librosa
     audio, sr = librosa.load(audio_file, sr=SAMPLE_RATE, mono=True)
 
     # Check duration
     audio_duration = len(audio) / SAMPLE_RATE
-    if audio_duration > max_chunk_length:
-        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to {max_chunk_length}s")
+    crop_duration = target_duration - padding_cutoff_delta
+
+    if audio_duration > crop_duration:
+        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to {crop_duration:.1f}s")
 
     # Convert to torch tensor
     audio_torch = torch.from_numpy(audio)
 
-    # Crop audio to chunk_length first (e.g., 9.5s), then pad to 10s for encoder
-    # This avoids hallucinations from hard cutoffs at exactly 10s
-    segment_samples = max_chunk_length * SAMPLE_RATE
-    audio_torch = _pad_or_trim(audio_torch, int(segment_samples))
+    # Crop audio first (e.g., 9s for 10s target), then pad to target_duration
+    # This avoids hallucinations from hard cutoffs at exactly the boundary
+    if padding_cutoff_delta > 0:
+        crop_samples = int(crop_duration * SAMPLE_RATE)
+        audio_torch = _pad_or_trim(audio_torch, crop_samples)
 
-    # Always pad to 10s (160000 samples) for encoder input, regardless of chunk_length
-    # The encoder expects exactly 10s input (1000 mel frames = 320000 bytes)
-    audio_torch = _pad_or_trim(audio_torch, int(N_SAMPLES_10S))
+    # Pad to target duration
+    target_samples = int(target_duration * SAMPLE_RATE)
+    audio_torch = _pad_or_trim(audio_torch, target_samples)
 
     # Compute mel spectrogram using efficient PyTorch STFT
     mel = _log_mel_spectrogram(audio_torch).to("cpu")
 
-    # Convert to numpy and reshape to [1, 80, 1, 1000]
+    # Convert to numpy and add batch dimension
     mel = mel.numpy()
-    mel = np.expand_dims(mel, axis=0)  # Add batch dimension
-    mel = np.expand_dims(mel, axis=2)  # Add spatial dimension for conv
+    mel = np.expand_dims(mel, axis=0)  # [80, N] -> [1, 80, N]
 
-    # Transpose to NHWC if needed (Hailo models expect this)
-    if is_nhwc:
-        mel = np.transpose(mel, [0, 2, 3, 1])  # [1, 80, 1, 1000] -> [1, 1, 1000, 80]
+    if format_4d:
+        # Add spatial dimension: [1, 80, N] -> [1, 80, 1, N]
+        mel = np.expand_dims(mel, axis=2)
+
+        # Transpose to NHWC if needed (HEF models expect this)
+        if is_nhwc:
+            mel = np.transpose(mel, [0, 2, 3, 1])  # [1, 80, 1, N] -> [1, 1, N, 80]
+    # else: 3D format [1, 80, N] for 30s ONNX encoder
 
     return mel.astype(np.float32)
 
@@ -221,21 +232,26 @@ class HailoWhisperPipeline:
     A pipeline for running inference using Hailo's Whisper models.
     """
 
-    def __init__(self, encoder_model_path: str, decoder_model_path: str = None, variant="tiny",
-                 decoder_assets_path=None, multi_process_service=False, decoder_onnx_dir=None):
+    def __init__(self, encoder_hef_path: str = None, decoder_hef_path: str = None, variant="tiny",
+                 decoder_assets_path=None, multi_process_service=False, decoder_onnx_dir=None,
+                 encoder_onnx_path: str = None, encoder_is_orig_onnx: bool = False):
         """
         Initialize the pipeline.
 
-        :param encoder_model_path: Path to the encoder HEF file.
-        :param decoder_model_path: Path to the decoder HEF file (not used if decoder_onnx_dir is provided).
+        :param encoder_hef_path: Path to the encoder HEF file (Hailo hardware, 10s).
+        :param encoder_onnx_path: Path to encoder ONNX file (10s or 30s, CPU). If provided, uses ONNX encoder instead of HEF.
+        :param encoder_is_orig_onnx: If True, treats encoder as original 30s ONNX (3D format [1, 80, 3000]). Otherwise 10s (4D format).
+        :param decoder_hef_path: Path to the decoder HEF file (not used if decoder_onnx_dir is provided).
         :param variant: Model variant (e.g., "tiny", "base").
         :param decoder_assets_path: Path to decoder assets directory (only for HEF decoder).
-        :param multi_process_service: Enable multi-process service mode.
+        :param multi_process_service: Enable multi-process service mode (HEF only).
         :param decoder_onnx_dir: Path to directory containing ONNX decoder files (decoder_model.onnx and decoder_with_past_model.onnx).
                                  If provided, uses ONNX decoder instead of HEF decoder.
         """
-        self.encoder_model_path = encoder_model_path
-        self.decoder_model_path = decoder_model_path
+        self.encoder_hef_path = encoder_hef_path
+        self.encoder_onnx_path = encoder_onnx_path
+        self.encoder_is_orig_onnx = encoder_is_orig_onnx
+        self.decoder_hef_path = decoder_hef_path
         self.decoder_onnx_dir = decoder_onnx_dir
         self.timeout_ms = 100000000
         self.variant = variant
@@ -246,26 +262,44 @@ class HailoWhisperPipeline:
         # load tokenizer
         self._load_tokenizer()
 
-        # Determine decoder mode
+        # Determine encoder and decoder modes
+        self.use_onnx_encoder = encoder_onnx_path is not None
         self.use_onnx_decoder = decoder_onnx_dir is not None
 
-        # initialize VDevice params
-        self.params = VDevice.create_params()
-        self.params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+        # Set preprocessing parameters based on encoder type
+        if self.encoder_is_orig_onnx:
+            self.encoder_target_duration = 30
+            self.encoder_format_4d = False  # Original 30s ONNX uses [1, 80, 3000]
+            self.encoder_is_nhwc = False
+        else:
+            self.encoder_target_duration = 10
+            self.encoder_format_4d = True   # 10s encoders use [1, 80, 1, 1000] or [1, 1, 1000, 80]
+            self.encoder_is_nhwc = (encoder_hef_path is not None)  # HEF uses NHWC, ONNX uses NCHW
 
-        if self.multi_process_service:
-            self.params.multi_process_service = True
-            self.params.group_id = "SHARED"
+        if self.use_onnx_encoder:
+            # ONNX encoder mode - load ONNX session
+            encoder_type = "30s original" if self.encoder_is_orig_onnx else "10s"
+            print(f"[INFO] Using ONNX encoder ({encoder_type}) from: {encoder_onnx_path}")
+            self.encoder_session = ort.InferenceSession(encoder_onnx_path)
+            # No VDevice needed for ONNX encoder
+        else:
+            # HEF encoder mode - initialize VDevice and Hailo resources
+            self.params = VDevice.create_params()
+            self.params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
 
-        # Create persistent VDevice and load HEF models
-        self.vdevice = VDevice(self.params)
-        self.encoder_infer_model = self.vdevice.create_infer_model(self.encoder_model_path)
-        self.encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
-        self.encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
+            if self.multi_process_service:
+                self.params.multi_process_service = True
+                self.params.group_id = "SHARED"
 
-        # Configure encoder once and create bindings (reduce overhead)
-        self.encoder_configured_infer_model = self.encoder_infer_model.configure()
-        self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
+            # Create persistent VDevice and load HEF models
+            self.vdevice = VDevice(self.params)
+            self.encoder_infer_model = self.vdevice.create_infer_model(self.encoder_hef_path)
+            self.encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
+            self.encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
+
+            # Configure encoder once and create bindings (reduce overhead)
+            self.encoder_configured_infer_model = self.encoder_infer_model.configure()
+            self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
 
         if self.use_onnx_decoder:
             # ONNX decoder mode - no token embeddings needed
@@ -298,11 +332,11 @@ class HailoWhisperPipeline:
             self.constant_output_0 = np.array([1])  # Unsqueeze axis
 
             # load HEF decoder
-            decoder_hef = HEF(self.decoder_model_path)
+            decoder_hef = HEF(self.decoder_hef_path)
             self.decoder_sorted_output_names = decoder_hef.get_sorted_output_names()
             self.decoder_model_name = decoder_hef.get_network_group_names()[0]
 
-            self.decoder_infer_model = self.vdevice.create_infer_model(self.decoder_model_path)
+            self.decoder_infer_model = self.vdevice.create_infer_model(self.decoder_hef_path)
             self.decoder_infer_model.input(f"{self.decoder_model_name}/input_layer1").set_format_type(FormatType.FLOAT32)
             self.decoder_infer_model.input(f"{self.decoder_model_name}/input_layer2").set_format_type(FormatType.FLOAT32)
             for output_name in self.decoder_sorted_output_names:
@@ -366,6 +400,41 @@ class HailoWhisperPipeline:
 
         return transpose_output
 
+    def cleanup(self):
+        """Clean up resources properly to avoid bus errors."""
+        try:
+            # Release ONNX sessions
+            if hasattr(self, 'encoder_session'):
+                del self.encoder_session
+            if hasattr(self, 'decoder_init_session'):
+                del self.decoder_init_session
+            if hasattr(self, 'decoder_cached_session'):
+                del self.decoder_cached_session
+
+            # Release configured models
+            if hasattr(self, 'encoder_configured_infer_model'):
+                del self.encoder_configured_infer_model
+            if hasattr(self, 'decoder_configured_infer_model'):
+                del self.decoder_configured_infer_model
+
+            # Release bindings
+            if hasattr(self, 'encoder_bindings'):
+                del self.encoder_bindings
+            if hasattr(self, 'decoder_bindings'):
+                del self.decoder_bindings
+
+            # Release infer models
+            if hasattr(self, 'encoder_infer_model'):
+                del self.encoder_infer_model
+            if hasattr(self, 'decoder_infer_model'):
+                del self.decoder_infer_model
+
+            # Release VDevice last
+            if hasattr(self, 'vdevice'):
+                del self.vdevice
+        except Exception as e:
+            print(f"Warning during cleanup: {e}")
+
     def get_transcript(self, input_mel_spec, debug=False, return_timing=False):
         """
         Main inference loop for processing input data and generating transcriptions.
@@ -414,6 +483,32 @@ class HailoWhisperPipeline:
             print(f"[DEBUG] Encoder output mean: {encoded_features.mean():.3f}, std: {encoded_features.std():.3f}")
 
         return encoded_features, encoder_time_ms
+
+    def _run_encoder_onnx(self, input_mel_spec, debug=False):
+        """Run encoder inference using ONNX Runtime (CPU)."""
+        encoder_start_total = time.time()
+
+        # ONNX encoders expect NCHW format: [1, 80, 1, 1000] for 10s or [1, 80, 3000] for 30s
+        # Input should already be in correct format from get_mel_spectrogram
+        input_name = self.encoder_session.get_inputs()[0].name
+
+        # Measure actual inference time
+        inference_start = time.time()
+        encoder_output = self.encoder_session.run(None, {input_name: input_mel_spec})[0]
+        inference_time_ms = (time.time() - inference_start) * 1000
+
+        encoder_time_ms = (time.time() - encoder_start_total) * 1000
+
+        # Print encoder timing info
+        print(f"[TIMING] Encoder total: {encoder_time_ms:.1f}ms")
+        print(f"[TIMING] Encoder inference only: {inference_time_ms:.1f}ms")
+        print(f"[TIMING] Encoder overhead: {encoder_time_ms - inference_time_ms:.1f}ms")
+        if debug:
+            print(f"[DEBUG] Encoder output shape: {encoder_output.shape}")
+            print(f"[DEBUG] Encoder output range: [{encoder_output.min():.3f}, {encoder_output.max():.3f}]")
+            print(f"[DEBUG] Encoder output mean: {encoder_output.mean():.3f}, std: {encoder_output.std():.3f}")
+
+        return encoder_output, encoder_time_ms
 
     def _run_decoder_hef(self, encoded_features, debug=False):
         """Run decoder inference using pre-loaded HEF model."""
@@ -640,8 +735,13 @@ class HailoWhisperPipeline:
         return transcription, total_decoder_time
 
     def _inference_hef(self, input_mel_spec, debug=False, return_timing=False):
-        """Run full HEF inference (encoder + decoder)."""
-        encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+        """Run full HEF decoder inference (encoder can be HEF or ONNX)."""
+        # Use appropriate encoder
+        if self.use_onnx_encoder:
+            encoded_features, encoder_time_ms = self._run_encoder_onnx(input_mel_spec, debug=debug)
+        else:
+            encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+
         transcription, decoder_time_ms = self._run_decoder_hef(encoded_features, debug=debug)
 
         print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
@@ -649,12 +749,17 @@ class HailoWhisperPipeline:
         if return_timing:
             return transcription, encoder_time_ms, decoder_time_ms
         return transcription
-    
+
     def _inference_onnx(self, input_mel_spec, debug=False, return_timing=False):
         """
-        Inference using ONNX decoder with KV-cache (hybrid mode: Hailo encoder + ONNX decoder).
+        Inference using ONNX decoder with KV-cache (encoder can be HEF or ONNX).
         """
-        encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+        # Use appropriate encoder
+        if self.use_onnx_encoder:
+            encoded_features, encoder_time_ms = self._run_encoder_onnx(input_mel_spec, debug=debug)
+        else:
+            encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+
         transcription, decoder_time_ms = self._run_decoder_onnx(encoded_features, debug=debug)
 
         print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
@@ -669,27 +774,39 @@ class HailoWhisperPipeline:
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Whisper on Hailo Inference Pipeline (Hybrid Mode Supported)")
-    parser.add_argument("--encoder_hef_file", type=str, required=True,
-                        help="Path to encoder HEF file")
+    parser = argparse.ArgumentParser(description="Whisper on Hailo Inference Pipeline (Supports HEF/ONNX encoders and decoders)")
+
+    # Encoder options (mutually exclusive)
+    encoder_group = parser.add_mutually_exclusive_group(required=True)
+    encoder_group.add_argument("--encoder_hef_file", type=str,
+                        help="Path to encoder HEF file (Hailo hardware, 10s)")
+    encoder_group.add_argument("--encoder_onnx_file", type=str,
+                        help="Path to encoder ONNX file (10s, CPU)")
+    encoder_group.add_argument("--encoder_orig_onnx_file", type=str,
+                        help="Path to original encoder ONNX file (30s, FP32, CPU)")
+
+    # Decoder options
     parser.add_argument("--decoder_hef_file", type=str, default=None,
                         help="Path to decoder HEF file (not used if --decoder_onnx_dir is provided)")
+    parser.add_argument("--decoder_onnx_dir", type=str, default=None,
+                        help="Path to directory containing ONNX decoder files (decoder_model.onnx and decoder_with_past_model.onnx)")
 
-    # Mutually exclusive group for audio input
+    # Audio input (mutually exclusive)
     audio_group = parser.add_mutually_exclusive_group(required=True)
     audio_group.add_argument("--audio_file", type=str,
                         help="Path to audio file to transcribe")
     audio_group.add_argument("--audio_folder", type=str,
-                        help="Path to folder containing <uid>.wav and <uid>.txt files for evaluation")
+                        help="Path to folder containing audio files (.wav/.mp3) and .txt ground truth files for WER evaluation")
 
+    # Other options
     parser.add_argument("--variant", type=str, default="tiny",
                         help="Model variant (e.g., 'tiny', 'base')")
     parser.add_argument("--decoder_assets_path", type=str, default=None,
                         help="Path to decoder assets directory (only for HEF decoder, default: ./decoder_assets)")
-    parser.add_argument("--decoder_onnx_dir", type=str, default=None,
-                        help="Path to directory containing ONNX decoder files (enables hybrid mode: Hailo encoder + ONNX decoder with KV-cache)")
     parser.add_argument("--multi_process_service", action="store_true",
-                        help="Enable multi-process service mode")
+                        help="Enable multi-process service mode (HEF only)")
+    parser.add_argument("--num_iterations", type=int, default=1,
+                        help="Number of iterations for single file benchmarking (default: 1)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug output (default: False)")
 
@@ -705,26 +822,60 @@ def main():
     if args.decoder_onnx_dir is None and args.decoder_hef_file is None:
         raise ValueError("Error: Either --decoder_hef_file or --decoder_onnx_dir must be provided")
 
+    # Determine encoder path and type
+    encoder_path = args.encoder_hef_file or args.encoder_onnx_file or args.encoder_orig_onnx_file
+    encoder_onnx_path = args.encoder_onnx_file or args.encoder_orig_onnx_file
+    encoder_is_orig = args.encoder_orig_onnx_file is not None
+
+    # Validate encoder/decoder compatibility (only HEF encoder works with HEF decoder)
+    if args.decoder_hef_file and (args.encoder_onnx_file or args.encoder_orig_onnx_file):
+        print("Warning: HEF decoder requires VDevice. Using ONNX encoder with HEF decoder may not work correctly.")
+
+    # num_iterations only makes sense for single file
+    if args.audio_folder and args.num_iterations > 1:
+        print("Warning: --num_iterations is ignored when using --audio_folder")
+        args.num_iterations = 1
+
 
     print(f"Initializing Whisper on Hailo Pipeline...")
-    print(f"  Encoder HEF: {args.encoder_hef_file}")
+
+    # Print encoder info
+    if args.encoder_hef_file:
+        print(f"  Encoder: HEF (Hailo hardware, 10s)")
+        print(f"    Path: {args.encoder_hef_file}")
+    elif args.encoder_orig_onnx_file:
+        print(f"  Encoder: ONNX Original (CPU, 30s)")
+        print(f"    Path: {args.encoder_orig_onnx_file}")
+    else:
+        print(f"  Encoder: ONNX (CPU, 10s)")
+        print(f"    Path: {args.encoder_onnx_file}")
+
+    # Print decoder info
     if args.decoder_onnx_dir:
-        print(f"  Decoder: ONNX (hybrid mode)")
-        print(f"  ONNX decoder dir: {args.decoder_onnx_dir}")
+        print(f"  Decoder: ONNX (KV-cache)")
+        print(f"    Path: {args.decoder_onnx_dir}")
     else:
         print(f"  Decoder: HEF")
-        print(f"  Decoder HEF: {args.decoder_hef_file}")
+        print(f"    Path: {args.decoder_hef_file}")
+
     print(f"  Variant: {args.variant}")
+
+    # Print audio input info
     if args.audio_file:
         print(f"  Audio file: {args.audio_file}")
+        if args.num_iterations > 1:
+            print(f"  Iterations: {args.num_iterations}")
     else:
         print(f"  Audio folder: {args.audio_folder}")
+
     print()
 
     # Initialize the pipeline
     pipeline = HailoWhisperPipeline(
-        encoder_model_path=args.encoder_hef_file,
-        decoder_model_path=args.decoder_hef_file,
+        encoder_hef_path=args.encoder_hef_file,
+        encoder_onnx_path=encoder_onnx_path,
+        encoder_is_orig_onnx=encoder_is_orig,
+        decoder_hef_path=args.decoder_hef_file,
         variant=args.variant,
         decoder_assets_path=args.decoder_assets_path,
         multi_process_service=args.multi_process_service,
@@ -739,21 +890,66 @@ def main():
         # Preprocess the audio file
         print("Preprocessing audio...")
         preprocess_start = time.time()
-        mel_spectrogram = get_mel_spectrogram(args.audio_file)
+        mel_spectrogram = get_mel_spectrogram(
+            args.audio_file,
+            target_duration=pipeline.encoder_target_duration,
+            format_4d=pipeline.encoder_format_4d,
+            is_nhwc=pipeline.encoder_is_nhwc
+        )
         preprocess_time_ms = (time.time() - preprocess_start) * 1000
         print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
         print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
         print()
 
-        # Run inference
-        print("Running inference...")
-        t1 = time.time()
-        transcription = pipeline.get_transcript(mel_spectrogram, debug=args.debug)
-        total_time_ms = (time.time() - t1) * 1000
-        print(f"[TIMING] Total get_transcript() time: {total_time_ms:.1f}ms")
+        # Run inference (potentially multiple iterations for benchmarking)
+        encoder_times = []
+        decoder_times = []
+        transcription = None
 
-        # Print result
-        print("=" * 30 + " TRANSCRIPTION:")
+        for iteration in range(args.num_iterations):
+            if args.num_iterations > 1:
+                print(f"Iteration {iteration + 1}/{args.num_iterations}...")
+
+            t1 = time.time()
+            result = pipeline.get_transcript(mel_spectrogram, debug=args.debug, return_timing=True)
+            total_time_ms = (time.time() - t1) * 1000
+
+            if args.num_iterations > 1:
+                # Multiple iterations: collect timing stats
+                transcription, encoder_time, decoder_time = result
+                encoder_times.append(encoder_time)
+                decoder_times.append(decoder_time)
+                print(f"[TIMING] Total get_transcript() time: {total_time_ms:.1f}ms\n")
+            else:
+                # Single iteration: standard output (transcription only or with timing)
+                if isinstance(result, tuple):
+                    transcription = result[0]
+                else:
+                    transcription = result
+                print(f"[TIMING] Total get_transcript() time: {total_time_ms:.1f}ms")
+
+        # Print benchmarking statistics if multiple iterations
+        if args.num_iterations > 1:
+            print(f"\n{'='*70}")
+            print(f"BENCHMARKING STATISTICS ({args.num_iterations} iterations)")
+            print(f"{'='*70}")
+            print(f"Encoder times (ms):")
+            print(f"  Mean: {np.mean(encoder_times):.1f} ± {np.std(encoder_times):.1f}")
+            print(f"  Min/Max: {np.min(encoder_times):.1f} / {np.max(encoder_times):.1f}")
+            print(f"  Median: {np.median(encoder_times):.1f}")
+            print(f"\nDecoder times (ms):")
+            print(f"  Mean: {np.mean(decoder_times):.1f} ± {np.std(decoder_times):.1f}")
+            print(f"  Min/Max: {np.min(decoder_times):.1f} / {np.max(decoder_times):.1f}")
+            print(f"  Median: {np.median(decoder_times):.1f}")
+            total_times = np.array(encoder_times) + np.array(decoder_times)
+            print(f"\nTotal times (ms):")
+            print(f"  Mean: {np.mean(total_times):.1f} ± {np.std(total_times):.1f}")
+            print(f"  Min/Max: {np.min(total_times):.1f} / {np.max(total_times):.1f}")
+            print(f"  Median: {np.median(total_times):.1f}")
+            print(f"{'='*70}")
+
+        # Print transcription result
+        print("\n" + "=" * 30 + " TRANSCRIPTION:")
         print(f"{transcription}")
         print("=" * 30)
 
@@ -778,7 +974,12 @@ def main():
 
             try:
                 # Preprocess audio
-                mel_spectrogram = get_mel_spectrogram(audio_file)
+                mel_spectrogram = get_mel_spectrogram(
+                    audio_file,
+                    target_duration=pipeline.encoder_target_duration,
+                    format_4d=pipeline.encoder_format_4d,
+                    is_nhwc=pipeline.encoder_is_nhwc
+                )
 
                 # Run inference with timing
                 transcription, encoder_time_ms, decoder_time_ms = pipeline.get_transcript(
@@ -834,6 +1035,9 @@ def main():
             print(f"{'='*70}")
         else:
             print("\nNo samples were successfully processed.")
+
+    # Clean up resources to avoid bus errors
+    pipeline.cleanup()
 
 
 if __name__ == "__main__":
