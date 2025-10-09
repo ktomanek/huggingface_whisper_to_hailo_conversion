@@ -450,7 +450,7 @@ class HailoWhisperPipeline:
             token_times.append(step_time_ms)
 
             generated_tokens.append(next_token)
-            decoder_input_ids[0][i + 1] = np.array([[next_token]], dtype=np.int64)
+            decoder_input_ids[0][i + 1] = next_token
 
             # Debug: Show token generation with timing
             if debug:
