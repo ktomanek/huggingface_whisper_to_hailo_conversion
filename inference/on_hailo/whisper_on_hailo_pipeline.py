@@ -355,16 +355,7 @@ class HailoWhisperPipeline:
         else:
             return self._inference_hef(input_mel_spec, debug=debug)
 
-    def _inference_hef(self, input_mel_spec, debug=False):
-        """Run full HEF inference (encoder + decoder)."""
-        # Run encoder
-        encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
 
-        # Run decoder
-        transcription, decoder_time_ms = self._run_decoder_hef(encoded_features, debug=debug)
-
-        print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
-        return transcription
 
     def _run_encoder_hef(self, input_mel_spec, debug=False):
         """Run encoder inference using pre-loaded HEF model."""
@@ -482,7 +473,7 @@ class HailoWhisperPipeline:
             print(f"\n[TIMING] Decoder Summary:")
             print(f"  Total tokens: {len(token_times)}")
             print(f"  Total time: {total_decoder_time:.1f}ms")
-            print(f"  Avg inference time (total): {avg_inference_time:.1f}ms")
+            print(f"  Avg per token (inference only): {avg_inference_time:.1f}ms")
             print(f"  Avg per token (total): {avg_token_time:.1f}ms")
             print(f"  Min/Max: {min(token_times):.1f}ms / {max(token_times):.1f}ms")
             if debug:
@@ -494,43 +485,18 @@ class HailoWhisperPipeline:
 
         return transcription, total_decoder_time
 
-    def _inference_onnx(self, input_mel_spec, debug=False):
-        """
-        Inference using ONNX decoder with KV-cache (hybrid mode: Hailo encoder + ONNX decoder).
-        """
+    def _run_decoder_onnx(self, encoded_features, debug=False):
+        """Run ONNX decoder with KV-cache."""
+        decoder_start_total = time.time()
+
         # Get output names for cache mapping (from pre-loaded sessions)
         decoder_outputs = [output.name for output in self.decoder_init_session.get_outputs()]
         decoder_with_past_outputs = [output.name for output in self.decoder_cached_session.get_outputs()]
 
-        # Run encoder
-        encoder_start_total = time.time()
-        input_mel = np.ascontiguousarray(input_mel_spec)
-
-        with self.encoder_infer_model.configure() as encoder_configured_infer_model:
-            encoder_bindings = encoder_configured_infer_model.create_bindings()
-
-            encoder_bindings.input().set_buffer(input_mel)
-            buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
-            encoder_bindings.output().set_buffer(buffer)
-
-            encoder_configured_infer_model.run([encoder_bindings], self.timeout_ms)
-            encoded_features = encoder_bindings.output().get_buffer().copy()
-
-        encoder_time_ms = (time.time() - encoder_start_total) * 1000
-
-        # Print encoder output info
-        print(f"[TIMING] Encoder: {encoder_time_ms:.1f}ms")
-        if debug:
-            print(f"[DEBUG] Encoder output shape: {encoded_features.shape}")
-            print(f"[DEBUG] Encoder output range: [{encoded_features.min():.3f}, {encoded_features.max():.3f}]")
-            print(f"[DEBUG] Encoder output mean: {encoded_features.mean():.3f}, std: {encoded_features.std():.3f}")
-
-        # Decoder - Use Whisper's forced decoder start tokens for ONNX
-        decoder_start_total = time.time()
-
         forced_tokens = [50258, 50259, 50359, 50363]  # <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
         generated_tokens = forced_tokens.copy()
         token_times = []
+        inference_times = []  # Track pure inference times
         past_key_values_dict = {}
 
         if debug:
@@ -544,10 +510,15 @@ class HailoWhisperPipeline:
             if not past_key_values_dict:
                 # First pass: process forced tokens and initialize cache
                 input_ids = np.array([forced_tokens], dtype=np.int64)
+
+                inference_start = time.time()
                 outputs = self.decoder_init_session.run(None, {
                     'input_ids': input_ids,
                     'encoder_hidden_states': encoded_features
                 })
+                inference_time_ms = (time.time() - inference_start) * 1000
+                inference_times.append(inference_time_ms)
+
                 logits = outputs[0]
 
                 # Store ALL cache outputs
@@ -564,7 +535,11 @@ class HailoWhisperPipeline:
                 inputs = {'input_ids': current_input_ids}
                 inputs.update(past_key_values_dict)
 
+                inference_start = time.time()
                 outputs = self.decoder_cached_session.run(None, inputs)
+                inference_time_ms = (time.time() - inference_start) * 1000
+                inference_times.append(inference_time_ms)
+
                 logits = outputs[0]
 
                 # Update cache for next iteration
@@ -608,21 +583,43 @@ class HailoWhisperPipeline:
         total_decoder_time = (time.time() - decoder_start_total) * 1000
 
         # Print decoder timing summary
-        if token_times:
-            sum_token_times = sum(token_times)
-            avg_token_time = np.mean(token_times)
-            print(f"\n[TIMING] Decoder Summary (ONNX with KV-cache):")
-            print(f"  Total tokens: {len(token_times)}")
-            print(f"  Total time: {total_decoder_time:.1f}ms")
-            print(f"  Avg per token: {avg_token_time:.1f}ms")
-            print(f"  Min/Max: {min(token_times):.1f}ms / {max(token_times):.1f}ms")
-            if len(token_times) > 1:
-                print(f"  First token: {token_times[0]:.1f}ms")
-                print(f"  Subsequent tokens: {np.mean(token_times[1:]):.1f}ms")
-            if debug:
-                print(f"  Sum of token times: {sum_token_times:.1f}ms")
-                print(f"  Overhead (total - sum): {total_decoder_time - sum_token_times:.1f}ms")
-            print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + total_decoder_time:.1f}ms")
+        sum_token_times = sum(token_times)
+        sum_inference_times = sum(inference_times)
+        avg_token_time = np.mean(token_times)
+        avg_inference_time = np.mean(inference_times)
+        print(f"\n[TIMING] Decoder Summary (ONNX with KV-cache):")
+        print(f"  Total tokens: {len(token_times)}")
+        print(f"  Total time: {total_decoder_time:.1f}ms")
+        print(f"  Avg per token (total): {avg_token_time:.1f}ms")
+        print(f"  Min/Max: {min(token_times):.1f}ms / {max(token_times):.1f}ms")
+        if len(token_times) > 1:
+            print(f"  First token: {token_times[0]:.1f}ms")
+            print(f"  Subsequent tokens: {np.mean(token_times[1:]):.1f}ms")
+        if debug:
+            print(f"  Sum of token times: {sum_token_times:.1f}ms")
+            print(f"  Sum of inference times: {sum_inference_times:.1f}ms")
+            print(f"  Avg per token (inference only): {avg_inference_time:.1f}ms")
+            print(f"  Per-token overhead: {avg_token_time - avg_inference_time:.1f}ms")
+            print(f"  Total overhead: {total_decoder_time - sum_token_times:.1f}ms")
+
+        return transcription, total_decoder_time
+
+    def _inference_hef(self, input_mel_spec, debug=False):
+        """Run full HEF inference (encoder + decoder)."""
+        encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+        transcription, decoder_time_ms = self._run_decoder_hef(encoded_features, debug=debug)
+
+        print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
+        return transcription
+    
+    def _inference_onnx(self, input_mel_spec, debug=False):
+        """
+        Inference using ONNX decoder with KV-cache (hybrid mode: Hailo encoder + ONNX decoder).
+        """
+        encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
+        transcription, decoder_time_ms = self._run_decoder_onnx(encoded_features, debug=debug)
+
+        print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
 
         return transcription
 
