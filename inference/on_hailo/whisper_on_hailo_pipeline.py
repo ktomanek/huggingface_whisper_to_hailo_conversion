@@ -17,7 +17,7 @@ import os
 import argparse
 import time
 from pathlib import Path
-from hailo_platform import (HEF, VDevice, HailoSchedulingAlgorithm, FormatType)
+from hailo_platform import (HEF, VDevice, HailoSchedulingAlgorithm, FormatType, Device)
 from transformers import AutoTokenizer
 import onnxruntime as ort
 
@@ -235,6 +235,9 @@ class HailoWhisperPipeline:
         :param decoder_onnx_dir: Path to directory containing ONNX decoder files (decoder_model.onnx and decoder_with_past_model.onnx).
                                  If provided, uses ONNX decoder instead of HEF decoder.
         """
+        import psutil
+        process = psutil.Process(os.getpid())
+
         self.encoder_hef_path = encoder_hef_path
         self.encoder_onnx_path = encoder_onnx_path
         self.encoder_is_orig_onnx = encoder_is_orig_onnx
@@ -267,7 +270,16 @@ class HailoWhisperPipeline:
             # ONNX encoder mode - load ONNX session
             encoder_type = "30s original" if self.encoder_is_orig_onnx else "10s"
             print(f"[INFO] Using ONNX encoder ({encoder_type}) from: {encoder_onnx_path}")
+
+            # Measure memory before loading encoder
+            mem_before_encoder = process.memory_info().rss
+
             self.encoder_session = ort.InferenceSession(encoder_onnx_path)
+
+            # Measure memory after loading encoder (before warmup)
+            mem_after_encoder = process.memory_info().rss
+            encoder_memory = (mem_after_encoder - mem_before_encoder) / (1024 * 1024)
+            print(f"[INFO] Encoder memory usage: {encoder_memory:.2f} MB")
 
             # Warmup ONNX encoder
             print(f"[INFO] Warming up ONNX encoder...")
@@ -281,6 +293,9 @@ class HailoWhisperPipeline:
             # No VDevice needed for ONNX encoder
         else:
             # HEF encoder mode - initialize VDevice and Hailo resources
+            # Measure memory before loading encoder
+            mem_before_encoder = process.memory_info().rss
+
             self.params = VDevice.create_params()
             self.params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
 
@@ -297,6 +312,11 @@ class HailoWhisperPipeline:
             # Configure encoder once and create bindings (reduce overhead)
             self.encoder_configured_infer_model = self.encoder_infer_model.configure()
             self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
+
+            # Measure memory after loading encoder (before warmup)
+            mem_after_encoder = process.memory_info().rss
+            encoder_memory = (mem_after_encoder - mem_before_encoder) / (1024 * 1024)
+            print(f"[INFO] Encoder memory usage: {encoder_memory:.2f} MB")
 
             # Warmup HEF encoder
             print(f"[INFO] Warming up HEF encoder...")
@@ -319,9 +339,17 @@ class HailoWhisperPipeline:
             if not os.path.exists(self.decoder_cached_path):
                 raise FileNotFoundError(f"ONNX cached decoder not found: {self.decoder_cached_path}")
 
+            # Measure memory before loading decoder
+            mem_before_decoder = process.memory_info().rss
+
             # Load ONNX sessions once
             self.decoder_init_session = ort.InferenceSession(self.decoder_init_path)
             self.decoder_cached_session = ort.InferenceSession(self.decoder_cached_path)
+
+            # Measure memory after loading decoder (before warmup)
+            mem_after_decoder = process.memory_info().rss
+            decoder_memory = (mem_after_decoder - mem_before_decoder) / (1024 * 1024)
+            print(f"[INFO] Decoder memory usage: {decoder_memory:.2f} MB")
 
             # Warmup ONNX decoder
             print(f"[INFO] Warming up ONNX decoder...")
@@ -335,6 +363,7 @@ class HailoWhisperPipeline:
         else:
             # HEF decoder mode - need token embeddings
             print(f"[INFO] Using HEF decoder")
+
             # Set decoder assets path
             if decoder_assets_path is None:
                 # Default to looking in the same directory as this script
@@ -343,10 +372,21 @@ class HailoWhisperPipeline:
             else:
                 self.decoder_assets_path = decoder_assets_path
 
+            # Measure memory before loading token embeddings
+            mem_before_embeddings = process.memory_info().rss
+
             # Token embedding
             self.token_embedding_weight = self._load_token_embedding_weight()
             self.onnx_add_input = self._load_onnx_add_input()
             self.constant_output_0 = np.array([1])  # Unsqueeze axis
+
+            # Measure memory after loading token embeddings (before HEF)
+            mem_after_embeddings = process.memory_info().rss
+            embeddings_memory = (mem_after_embeddings - mem_before_embeddings) / (1024 * 1024)
+            print(f"[INFO] Token embeddings memory usage: {embeddings_memory:.2f} MB")
+
+            # Measure memory before loading HEF decoder model
+            mem_before_decoder_hef = process.memory_info().rss
 
             # load HEF decoder
             decoder_hef = HEF(self.decoder_hef_path)
@@ -362,6 +402,15 @@ class HailoWhisperPipeline:
             # Configure decoder once and create bindings (reduce overhead)
             self.decoder_configured_infer_model = self.decoder_infer_model.configure()
             self.decoder_bindings = self.decoder_configured_infer_model.create_bindings()
+
+            # Measure memory after loading HEF decoder model (before warmup)
+            mem_after_decoder_hef = process.memory_info().rss
+            decoder_hef_memory = (mem_after_decoder_hef - mem_before_decoder_hef) / (1024 * 1024)
+            print(f"[INFO] HEF decoder model memory usage: {decoder_hef_memory:.2f} MB")
+
+            # Print total decoder memory (embeddings + HEF model)
+            total_decoder_memory = embeddings_memory + decoder_hef_memory
+            print(f"[INFO] Total decoder memory usage: {total_decoder_memory:.2f} MB")
 
             # Warmup HEF decoder
             print(f"[INFO] Warming up HEF decoder...")
@@ -418,6 +467,41 @@ class HailoWhisperPipeline:
         Load the tokenizer for the specified variant.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(f"openai/whisper-{self.variant}")
+
+    def get_hailo_device_info(self):
+        """
+        Get Hailo device information including temperature.
+        Only works when using HEF models (requires VDevice).
+
+        Returns:
+            dict with 'temperature' (float) and 'device_info' keys, or None if not available
+        """
+        if not hasattr(self, 'vdevice'):
+            return None
+
+        try:
+            # Scan for Hailo devices
+            device_infos = Device.scan()
+            if not device_infos:
+                return None
+
+            # Get first device
+            device = Device(device_infos[0])
+
+            # Get temperature
+            temp_info = device.control.get_chip_temperature()
+            temperature = temp_info.ts0_temperature
+
+            # Get extended device information
+            extended_info = device.control.get_extended_device_information()
+
+            return {
+                'temperature': temperature,
+                'device_info': extended_info
+            }
+        except Exception as e:
+            print(f"[WARNING] Could not get Hailo device info: {e}")
+            return None
 
     def _tokenization(self, decoder_input_ids):
         """
@@ -927,6 +1011,14 @@ def main():
     )
 
     print("Pipeline initialized successfully!")
+
+    # Print Hailo device info if available (debug mode only)
+    if args.debug and hasattr(pipeline, 'vdevice'):
+        hailo_info = pipeline.get_hailo_device_info()
+        if hailo_info:
+            print(f"[HAILO] Device temperature: {hailo_info['temperature']:.1f}°C")
+            print(f"[HAILO] Device info: {hailo_info['device_info']}")
+
     print()
 
     # Mode 1: Single audio file
