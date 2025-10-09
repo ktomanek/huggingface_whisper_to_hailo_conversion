@@ -91,11 +91,12 @@ def _apply_repetition_penalty(logits, generated_tokens, penalty=1.5, last_window
 
 # TODO factor our into separate file
 
+MAX_AUDIO_LENGTH_S = 10  # seconds
 # Audio hyperparameters (from Whisper)
 SAMPLE_RATE = 16000
 N_FFT = 400
 HOP_LENGTH = 160
-N_SAMPLES_10S = 10 * SAMPLE_RATE  # 160000 samples in 10 seconds
+N_SAMPLES_10S = MAX_AUDIO_LENGTH_S * SAMPLE_RATE  # 160000 samples in 10 seconds
 
 
 def _pad_or_trim(array, length: int = N_SAMPLES_10S, *, axis: int = -1):
@@ -158,13 +159,15 @@ def _log_mel_spectrogram(audio: torch.Tensor, n_mels: int = 80, padding: int = 0
     return log_spec
 
 
-def get_mel_spectrogram(audio_file, chunk_length=10, is_nhwc=True):
+def get_mel_spectrogram(audio_file, max_chunk_length=9, is_nhwc=True):
     """
     Load audio file and convert to mel spectrogram (Hailo-efficient implementation).
 
     Args:
         audio_file: Path to audio file
-        chunk_length: Duration in seconds (default: 10 for 10s encoder)
+        chunk_length: Duration in seconds (default: 9.5s to avoid boundary hallucinations.
+                     Using exactly 10s can cause Whisper to hallucinate due to hard cutoffs
+                     at the model's training boundary. Reducing to 9.5s leaves natural padding.)
         is_nhwc: Whether to transpose to NHWC format (default: True for Hailo models)
 
     Returns:
@@ -175,15 +178,20 @@ def get_mel_spectrogram(audio_file, chunk_length=10, is_nhwc=True):
 
     # Check duration
     audio_duration = len(audio) / SAMPLE_RATE
-    if audio_duration > chunk_length:
-        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to {chunk_length}s")
+    if audio_duration > max_chunk_length:
+        print(f"   ⚠️  Audio is {audio_duration:.1f}s, cropping to {max_chunk_length}s")
 
     # Convert to torch tensor
     audio_torch = torch.from_numpy(audio)
 
-    # Pad or trim to target length
-    segment_samples = chunk_length * SAMPLE_RATE
+    # Crop audio to chunk_length first (e.g., 9.5s), then pad to 10s for encoder
+    # This avoids hallucinations from hard cutoffs at exactly 10s
+    segment_samples = max_chunk_length * SAMPLE_RATE
     audio_torch = _pad_or_trim(audio_torch, int(segment_samples))
+
+    # Always pad to 10s (160000 samples) for encoder input, regardless of chunk_length
+    # The encoder expects exactly 10s input (1000 mel frames = 320000 bytes)
+    audio_torch = _pad_or_trim(audio_torch, int(N_SAMPLES_10S))
 
     # Compute mel spectrogram using efficient PyTorch STFT
     mel = _log_mel_spectrogram(audio_torch).to("cpu")
@@ -399,24 +407,35 @@ class HailoWhisperPipeline:
         """Run decoder inference using pre-loaded HEF model."""
         decoder_start_total = time.time()
 
+        # NOTE: This implementation uses forced decoder tokens, which differs from Hailo's reference implementation.
+        # Hailo's reference starts with only [50258] (<|startoftranscript|>) and generates all tokens including
+        # language, task, and timestamp tokens. We instead force the standard Whisper control tokens:
+        #   50258: <|startoftranscript|>
+        #   50259: <|en|> (English language)
+        #   50359: <|transcribe|> (transcription task)
+        #   50363: <|notimestamps|> (no timestamp prediction)
+        # This matches the ONNX decoder behavior and reduces token generation overhead by ~3 tokens per inference.
+        forced_tokens = [50258, 50259, 50359, 50363]
         generated_tokens = []
         token_times = []
 
-        # Decoder - Hailo approach: start with just <|startoftranscript|> and generate everything
-        start_token_id = [50258]
-        decoder_input_ids = np.array([[start_token_id[0]]], dtype=np.int64)
+        # Initialize decoder_input_ids with forced tokens
+        decoder_input_ids = np.array([forced_tokens], dtype=np.int64)
         decoder_input_ids = np.concatenate(
-            [decoder_input_ids, np.zeros((1, self.decoding_sequence_length - 1), dtype=np.int64)], axis=1
+            [decoder_input_ids, np.zeros((1, self.decoding_sequence_length - len(forced_tokens)), dtype=np.int64)], axis=1
         )
 
         if debug:
-            print(f"[DEBUG] Decoder input IDs initialized: {decoder_input_ids[0][:8]}")
+            print(f"[DEBUG] Decoder input IDs initialized with forced tokens: {decoder_input_ids[0][:8]}")
+            print(f"[DEBUG] Forced tokens: {forced_tokens}")
             print(f"[DEBUG] Starting decoder with {self.decoding_sequence_length} max tokens")
 
         # Reuse pre-configured bindings
         # Run Decoder Iteratively
         inference_times = []  # Track pure inference times
-        for i in range(self.decoding_sequence_length - 1):
+        num_forced = len(forced_tokens)
+
+        for i in range(num_forced - 1, self.decoding_sequence_length - 1):
             step_start = time.time()
 
             tokenized_ids = self._tokenization(decoder_input_ids)
@@ -442,7 +461,7 @@ class HailoWhisperPipeline:
                 [self.decoder_bindings.output(name).get_buffer() for name in self.decoder_sorted_output_names], axis=2
             )
 
-            # Decoder post-processing
+            # Decoder post-processing (apply penalty only to generated tokens, not forced ones)
             logits = _apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=REPETITION_PENALTY)
             next_token = np.argmax(logits)
 
