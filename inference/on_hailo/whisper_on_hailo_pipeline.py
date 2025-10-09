@@ -281,6 +281,16 @@ class HailoWhisperPipeline:
             encoder_type = "30s original" if self.encoder_is_orig_onnx else "10s"
             print(f"[INFO] Using ONNX encoder ({encoder_type}) from: {encoder_onnx_path}")
             self.encoder_session = ort.InferenceSession(encoder_onnx_path)
+
+            # Warmup ONNX encoder
+            print(f"[INFO] Warming up ONNX encoder...")
+            if self.encoder_is_orig_onnx:
+                dummy_input = np.random.randn(1, 80, 3000).astype(np.float32)
+            else:
+                dummy_input = np.random.randn(1, 80, 1, 1000).astype(np.float32)
+            input_name = self.encoder_session.get_inputs()[0].name
+            _ = self.encoder_session.run(None, {input_name: dummy_input})
+            print(f"[INFO] ONNX encoder warmup complete")
             # No VDevice needed for ONNX encoder
         else:
             # HEF encoder mode - initialize VDevice and Hailo resources
@@ -301,6 +311,16 @@ class HailoWhisperPipeline:
             self.encoder_configured_infer_model = self.encoder_infer_model.configure()
             self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
 
+            # Warmup HEF encoder
+            print(f"[INFO] Warming up HEF encoder...")
+            dummy_input = np.random.randn(1, 1, 1000, 80).astype(np.float32)
+            dummy_input_contiguous = np.ascontiguousarray(dummy_input)
+            self.encoder_bindings.input().set_buffer(dummy_input_contiguous)
+            buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
+            self.encoder_bindings.output().set_buffer(buffer)
+            self.encoder_configured_infer_model.run([self.encoder_bindings], self.timeout_ms)
+            print(f"[INFO] HEF encoder warmup complete")
+
         if self.use_onnx_decoder:
             # ONNX decoder mode - no token embeddings needed
             print(f"[INFO] Using ONNX decoder from: {decoder_onnx_dir}")
@@ -315,6 +335,16 @@ class HailoWhisperPipeline:
             # Load ONNX sessions once
             self.decoder_init_session = ort.InferenceSession(self.decoder_init_path)
             self.decoder_cached_session = ort.InferenceSession(self.decoder_cached_path)
+
+            # Warmup ONNX decoder
+            print(f"[INFO] Warming up ONNX decoder...")
+            dummy_encoder_output = np.random.randn(1, 500, 384).astype(np.float32)
+            dummy_input_ids = np.array([[50258, 50259, 50359, 50363]], dtype=np.int64)
+            _ = self.decoder_init_session.run(None, {
+                'input_ids': dummy_input_ids,
+                'encoder_hidden_states': dummy_encoder_output
+            })
+            print(f"[INFO] ONNX decoder warmup complete")
         else:
             # HEF decoder mode - need token embeddings
             print(f"[INFO] Using HEF decoder")
@@ -345,6 +375,26 @@ class HailoWhisperPipeline:
             # Configure decoder once and create bindings (reduce overhead)
             self.decoder_configured_infer_model = self.decoder_infer_model.configure()
             self.decoder_bindings = self.decoder_configured_infer_model.create_bindings()
+
+            # Warmup HEF decoder
+            print(f"[INFO] Warming up HEF decoder...")
+            dummy_encoder_output = np.random.randn(1, 500, 384).astype(np.float32)
+            dummy_decoder_input_ids = np.array([[50258, 50259, 50359, 50363]], dtype=np.int64)
+            dummy_decoder_input_ids = np.concatenate(
+                [dummy_decoder_input_ids, np.zeros((1, self.decoding_sequence_length - 4), dtype=np.int64)], axis=1
+            )
+            tokenized_ids = self._tokenization(dummy_decoder_input_ids)
+
+            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer1").set_buffer(dummy_encoder_output)
+            self.decoder_bindings.input(f"{self.decoder_model_name}/input_layer2").set_buffer(tokenized_ids)
+            buffers = [
+                np.zeros(self.decoder_infer_model.output(name).shape).astype(np.float32)
+                for name in self.decoder_sorted_output_names
+            ]
+            for name, buffer in zip(self.decoder_sorted_output_names, buffers):
+                self.decoder_bindings.output(name).set_buffer(buffer)
+            self.decoder_configured_infer_model.run([self.decoder_bindings], self.timeout_ms)
+            print(f"[INFO] HEF decoder warmup complete")
 
     def _load_token_embedding_weight(self):
         """
