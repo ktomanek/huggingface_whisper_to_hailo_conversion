@@ -2,12 +2,21 @@
 """
 Hailo Whisper Captioning App
 
-A self-contained real-time speech captioning application using Hailo HEF encoder + ONNX decoder.
-Optimized for best speed/accuracy tradeoff on Hailo hardware.
+A self-contained real-time speech captioning application using hybrid encoder + ONNX decoder.
+Supports both Hailo HEF encoder (NPU) and ONNX encoder (CPU) for maximum flexibility.
 
-Usage:
+Usage Examples:
+
+1. Using Hailo HEF encoder (NPU, fastest):
     python hailo_captioning_app.py \
         --encoder_hef_file /path/to/encoder.hef \
+        --decoder_onnx_dir /path/to/decoder_onnx \
+        --language en \
+        --min_partial_duration 0.2
+
+2. Using ONNX encoder (CPU, portable):
+    python hailo_captioning_app.py \
+        --encoder_onnx_file /path/to/encoder_10s.onnx \
         --decoder_onnx_dir /path/to/decoder_onnx \
         --language en \
         --min_partial_duration 0.2
@@ -55,9 +64,9 @@ EOS_MIN_SILENCE = 100
 MAXIMUM_SEGMENT_DURATION = 9.0 #because of 10sec encoder max (where 1sec padding helps to avoid hallucinations)
 
 
-def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0, sample_rate=None):
+def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0, sample_rate=None, is_nhwc=True):
     """
-    Convert audio data (numpy array) to mel spectrogram for Hailo HEF encoder (NHWC format).
+    Convert audio data (numpy array) to mel spectrogram.
     Uses shared helper functions from whisper_on_hailo_pipeline.
 
     Args:
@@ -65,9 +74,10 @@ def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0
         target_duration: Target duration in seconds (default: 10)
         padding_cutoff_delta: Time to cut off before target to avoid hallucinations (default: 1.0)
         sample_rate: Sample rate in Hz (default: SAMPLING_RATE constant = 16000)
+        is_nhwc: If True, return NHWC format [1, 1, N, 80] for HEF. If False, return NCHW [1, 80, 1, N] for ONNX.
 
     Returns:
-        mel_spectrogram: [1, 1, N, 80] (NHWC format for HEF)
+        mel_spectrogram: [1, 1, N, 80] (NHWC for HEF) or [1, 80, 1, N] (NCHW for ONNX)
     """
     if sample_rate is None:
         sample_rate = SAMPLING_RATE
@@ -88,11 +98,14 @@ def get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0
     # Compute mel spectrogram using shared function
     mel = _log_mel_spectrogram(audio_torch, sample_rate=sample_rate).to("cpu")
 
-    # Convert to numpy and reshape to NHWC [1, 1, N, 80]
+    # Convert to numpy and reshape
     mel = mel.numpy()
     mel = np.expand_dims(mel, axis=0)  # [80, N] -> [1, 80, N]
     mel = np.expand_dims(mel, axis=2)  # [1, 80, N] -> [1, 80, 1, N]
-    mel = np.transpose(mel, [0, 2, 3, 1])  # [1, 80, 1, N] -> [1, 1, N, 80] (NHWC)
+
+    # Transpose to NHWC if needed (Hailo HEF), otherwise keep NCHW (ONNX)
+    if is_nhwc:
+        mel = np.transpose(mel, [0, 2, 3, 1])  # [1, 80, 1, N] -> [1, 1, N, 80] (NHWC)
 
     return mel.astype(np.float32)
 
@@ -170,42 +183,65 @@ class Transcriber:
 
 
 class HailoWhisperTranscriber(Transcriber):
-    """Hailo HEF encoder + ONNX decoder transcriber"""
+    """Hybrid encoder (HEF or ONNX) + ONNX decoder transcriber"""
 
     MAX_OUTPUT_LEN = 447  # Whisper upper bound (0-indexed)
 
     def __init__(self, model_name_or_path, sampling_rate, show_word_confidence_scores=False, language=DEFAULT_LANGUAGE,
-                 encoder_hef_path=None, decoder_onnx_dir=None, output_streaming=True, variant="tiny"):
+                 encoder_hef_path=None, encoder_onnx_path=None, decoder_onnx_dir=None, output_streaming=True, variant="tiny"):
         self.encoder_hef_path = encoder_hef_path
+        self.encoder_onnx_path = encoder_onnx_path
         self.decoder_onnx_dir = decoder_onnx_dir
         self.variant = variant
 
-        if not encoder_hef_path:
-            raise ValueError("encoder_hef_path is required for HailoWhisperTranscriber")
+        # At least one encoder must be provided
+        if not encoder_hef_path and not encoder_onnx_path:
+            raise ValueError("Either encoder_hef_path or encoder_onnx_path is required")
+
+        # Only one encoder can be used at a time
+        if encoder_hef_path and encoder_onnx_path:
+            raise ValueError("Cannot use both HEF and ONNX encoder simultaneously. Choose one.")
+
         if not decoder_onnx_dir:
             raise ValueError("decoder_onnx_dir is required for HailoWhisperTranscriber")
+
+        # Determine encoder type
+        self.encoder_type = "hef" if encoder_hef_path else "onnx"
 
         super().__init__(model_name_or_path, sampling_rate, show_word_confidence_scores, language, output_streaming)
 
     def _load_model(self, model_name_or_path):
-        """Load Hailo HEF encoder and ONNX decoder"""
-        print(f"[INFO] Loading Hailo HEF encoder from: {self.encoder_hef_path}")
+        """Load encoder (HEF or ONNX) and ONNX decoder"""
         print(f"[INFO] Loading ONNX decoder from: {self.decoder_onnx_dir}")
 
-        # Initialize Hailo HEF encoder
-        params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+        # Load encoder based on type
+        if self.encoder_type == "hef":
+            print(f"[INFO] Loading Hailo HEF encoder from: {self.encoder_hef_path}")
 
-        self.vdevice = VDevice(params)
-        self.encoder_infer_model = self.vdevice.create_infer_model(self.encoder_hef_path)
-        self.encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
-        self.encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
+            # Initialize Hailo HEF encoder
+            params = VDevice.create_params()
+            params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
 
-        # Configure encoder and create bindings
-        self.encoder_configured_infer_model = self.encoder_infer_model.configure()
-        self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
+            self.vdevice = VDevice(params)
+            self.encoder_infer_model = self.vdevice.create_infer_model(self.encoder_hef_path)
+            self.encoder_infer_model.input().set_format_type(FormatType.FLOAT32)
+            self.encoder_infer_model.output().set_format_type(FormatType.FLOAT32)
 
-        print(f"[INFO] HEF encoder loaded successfully")
+            # Configure encoder and create bindings
+            self.encoder_configured_infer_model = self.encoder_infer_model.configure()
+            self.encoder_bindings = self.encoder_configured_infer_model.create_bindings()
+
+            print(f"[INFO] HEF encoder loaded successfully")
+
+        else:  # onnx
+            print(f"[INFO] Loading ONNX encoder from: {self.encoder_onnx_path}")
+
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+            self.encoder_session = ort.InferenceSession(self.encoder_onnx_path, sess_options=sess_options)
+
+            print(f"[INFO] ONNX encoder loaded successfully")
 
         # Load ONNX decoder
         decoder_init_path = os.path.join(self.decoder_onnx_dir, "decoder_model.onnx")
@@ -261,27 +297,36 @@ class HailoWhisperTranscriber(Transcriber):
         return token_id
 
     def _encode_audio(self, input_mel_spec):
-        """Encode audio using Hailo HEF encoder"""
-        input_mel = np.ascontiguousarray(input_mel_spec)
+        """Encode audio using HEF or ONNX encoder"""
+        if self.encoder_type == "hef":
+            # Hailo HEF encoder
+            input_mel = np.ascontiguousarray(input_mel_spec)
 
-        # Reuse pre-configured bindings
-        self.encoder_bindings.input().set_buffer(input_mel)
-        buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
-        self.encoder_bindings.output().set_buffer(buffer)
+            # Reuse pre-configured bindings
+            self.encoder_bindings.input().set_buffer(input_mel)
+            buffer = np.zeros(self.encoder_infer_model.output().shape).astype(np.float32)
+            self.encoder_bindings.output().set_buffer(buffer)
 
-        # Run inference
-        self.encoder_configured_infer_model.run([self.encoder_bindings], 100000000)  # timeout_ms
-        encoded_features = self.encoder_bindings.output().get_buffer().copy()
+            # Run inference
+            self.encoder_configured_infer_model.run([self.encoder_bindings], 100000000)  # timeout_ms
+            encoded_features = self.encoder_bindings.output().get_buffer().copy()
+
+        else:  # onnx
+            # ONNX encoder
+            input_name = self.encoder_session.get_inputs()[0].name
+            encoded_features = self.encoder_session.run(None, {input_name: input_mel_spec})[0]
 
         return encoded_features
 
     def _transcribe(self, audio_data, segment_end):
-        """Perform transcription using Hailo encoder + ONNX decoder"""
+        """Perform transcription using encoder (HEF or ONNX) + ONNX decoder"""
         try:
-            # Preprocess audio to mel spectrogram
-            input_mel_spec = get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0)
+            # Preprocess audio to mel spectrogram with appropriate format
+            # HEF needs NHWC [1, 1, N, 80], ONNX needs NCHW [1, 80, 1, N]
+            is_nhwc = (self.encoder_type == "hef")
+            input_mel_spec = get_mel_spectrogram(audio_data, target_duration=10, padding_cutoff_delta=1.0, is_nhwc=is_nhwc)
 
-            # Encode audio with Hailo HEF
+            # Encode audio with encoder (HEF or ONNX)
             encoder_hidden_states = self._encode_audio(input_mel_spec)
 
             if self.output_streaming:
@@ -628,19 +673,27 @@ def capture_audio_from_stream(audio_stream, audio_queue, stop_threads, caption_p
 
 def get_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Hailo Whisper Real-time Captioning (HEF encoder + ONNX decoder)")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="Hailo Whisper Real-time Captioning (Hybrid encoder + ONNX decoder)")
+
+    # Encoder options (mutually exclusive)
+    encoder_group = parser.add_mutually_exclusive_group()
+    encoder_group.add_argument(
         "--encoder_hef_file",
         type=str,
-        default="models/hef/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef",
-        # required=True,
-        help="Path to Hailo HEF encoder file",
+        default=None,
+        help="Path to Hailo HEF encoder file (NHWC format, runs on NPU). Default if no encoder specified.",
     )
+    encoder_group.add_argument(
+        "--encoder_onnx_file",
+        type=str,
+        help="Path to ONNX encoder file (NCHW format, runs on CPU, 10s INT8 model)",
+    )
+
+    # Decoder options
     parser.add_argument(
         "--decoder_onnx_dir",
         type=str,
         default="models/onnx/whisper_optimum_onnx_conversions/whisper_tiny_onnx/default_int8",
-        #required=True,
         help="Path to directory containing ONNX decoder files (decoder_model.onnx, decoder_with_past_model.onnx)",
     )
     parser.add_argument(
@@ -707,20 +760,29 @@ def main():
         list_audio_devices()
         return
 
+    # Apply default HEF encoder if neither encoder is specified
+    if not args.encoder_hef_file and not args.encoder_onnx_file:
+        args.encoder_hef_file = "models/hef/HEF_h8l_from_hailo/tiny-whisper-encoder-10s_15dB_h8l.hef"
+        print(f"No encoder specified, using default HEF encoder: {args.encoder_hef_file}")
+
     # Create caption printer
     caption_printer = PlainCaptionPrinter(verbose=args.verbose)
 
     # Initialize VAD
     vad = get_vad(eos_min_silence=args.eos_min_silence)
 
-    # Load Hailo Whisper model
-    print(f"Loading Hailo Whisper model (HEF encoder + ONNX decoder)")
+    # Determine encoder type for display
+    encoder_type_display = "HEF (Hailo NPU)" if args.encoder_hef_file else "ONNX (CPU INT8)"
+
+    # Load Whisper model
+    print(f"Loading Whisper model ({encoder_type_display} encoder + ONNX decoder)")
     asr_model = HailoWhisperTranscriber(
         model_name_or_path='hailo-whisper',
         sampling_rate=SAMPLING_RATE,
         show_word_confidence_scores=args.show_word_confidence_scores,
         language=args.language,
         encoder_hef_path=args.encoder_hef_file,
+        encoder_onnx_path=args.encoder_onnx_file,
         decoder_onnx_dir=args.decoder_onnx_dir,
         output_streaming=False,  # Use retranscribe mode (default)
         variant=args.variant
