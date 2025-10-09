@@ -67,33 +67,12 @@ excluded_tokens = [11, 13]  # Punctuation tokens to exclude from repetition pena
 
 REPETITION_PENALTY = 1.5
 
-def _apply_repetition_penalty(logits, generated_tokens, penalty=1.5, last_window=8):
-    """
-    Apply repetition penalty to the logits.
-    Args:
-        logits: The logits from the model (shape: (vocab_size,)).
-        generated_tokens: List of previously generated tokens.
-        penalty: The penalty factor (higher values discourage repetitions).
-    Returns:
-        logits: The logits with repetition penalty applied.
-    """
-    logits = np.squeeze(logits, axis=0)
-    recent_tokens = generated_tokens[-last_window:] if len(generated_tokens) >= last_window else generated_tokens
-
-    # Combine the tokens from both windows
-    recent_tokens = set(recent_tokens)
-
-    for token in recent_tokens:
-        if token not in excluded_tokens:
-            logits[token] /= penalty
-    return logits
-
 
 # ============================================================================
 # Audio Preprocessing (Hailo-efficient implementation)
 # ============================================================================
 
-# TODO factor our into separate file
+# TODO factor out into separate file
 
 MAX_AUDIO_LENGTH_S = 10  # seconds
 # Audio hyperparameters (from Whisper)
@@ -619,8 +598,15 @@ class HailoWhisperPipeline:
             )
 
             # Decoder post-processing (apply penalty only to generated tokens, not forced ones)
-            logits = _apply_repetition_penalty(decoder_outputs[:, i], generated_tokens, penalty=REPETITION_PENALTY)
-            next_token = np.argmax(logits)
+            # Match ONNX decoder approach: penalize ALL generated tokens with proper positive/negative handling
+            next_token_logits = decoder_outputs[:, i].flatten().copy()
+            tokens_to_penalize = set(generated_tokens)
+            for token_id in tokens_to_penalize:
+                if next_token_logits[token_id] > 0:
+                    next_token_logits[token_id] /= REPETITION_PENALTY
+                else:
+                    next_token_logits[token_id] *= REPETITION_PENALTY
+            next_token = np.argmax(next_token_logits)
 
             step_time_ms = (time.time() - step_start) * 1000
             token_times.append(step_time_ms)
