@@ -35,10 +35,10 @@ except ImportError:
 
 def load_audio_dataset(audio_folder: str) -> Dict[str, str]:
     """
-    Load audio dataset with paired .wav and .txt files.
+    Load audio dataset with paired audio (.wav or .mp3) and .txt files.
 
     Args:
-        audio_folder: Path to folder containing <uid>.wav and <uid>.txt files
+        audio_folder: Path to folder containing <uid>.wav/.mp3 and <uid>.txt files
 
     Returns:
         Dictionary mapping audio file paths to ground truth transcriptions
@@ -50,25 +50,25 @@ def load_audio_dataset(audio_folder: str) -> Dict[str, str]:
 
     dataset = {}
 
-    # Find all .wav files
-    wav_files = list(audio_folder.glob("*.wav"))
+    # Find all .wav and .mp3 files
+    audio_files = list(audio_folder.glob("*.wav")) + list(audio_folder.glob("*.mp3"))
 
-    if not wav_files:
-        raise ValueError(f"No .wav files found in {audio_folder}")
+    if not audio_files:
+        raise ValueError(f"No .wav or .mp3 files found in {audio_folder}")
 
-    for wav_file in wav_files:
+    for audio_file in audio_files:
         # Look for corresponding .txt file
-        txt_file = wav_file.with_suffix('.txt')
+        txt_file = audio_file.with_suffix('.txt')
 
         if not txt_file.exists():
-            print(f"Warning: No ground truth found for {wav_file.name}, skipping")
+            print(f"Warning: No ground truth found for {audio_file.name}, skipping")
             continue
 
         # Read ground truth transcription
         with open(txt_file, 'r', encoding='utf-8') as f:
             ground_truth = f.read().strip()
 
-        dataset[str(wav_file)] = ground_truth
+        dataset[str(audio_file)] = ground_truth
 
     print(f"Loaded {len(dataset)} audio files with ground truth")
     return dataset

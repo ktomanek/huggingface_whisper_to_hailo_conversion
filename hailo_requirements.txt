@@ -4,3 +4,4 @@ librosa
 onnxruntime
 faster_whisper
 transformers
+jiwer

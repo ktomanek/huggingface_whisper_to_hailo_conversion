@@ -16,6 +16,7 @@ import numpy as np
 import os
 import argparse
 import time
+from pathlib import Path
 from hailo_platform import (HEF, VDevice, HailoSchedulingAlgorithm, FormatType)
 from transformers import AutoTokenizer
 import onnxruntime as ort
@@ -23,6 +24,9 @@ import onnxruntime as ort
 # For efficient audio preprocessing
 import librosa
 import torch
+
+# For evaluation
+from evaluation import load_audio_dataset, calculate_wer
 
 
 # Usage Examples:
@@ -362,14 +366,22 @@ class HailoWhisperPipeline:
 
         return transpose_output
 
-    def get_transcript(self, input_mel_spec, debug=False):
+    def get_transcript(self, input_mel_spec, debug=False, return_timing=False):
         """
         Main inference loop for processing input data and generating transcriptions.
+
+        Args:
+            input_mel_spec: Mel spectrogram input
+            debug: Enable debug output
+            return_timing: If True, returns (transcription, encoder_time_ms, decoder_time_ms)
+
+        Returns:
+            transcription (str) or (transcription, encoder_time_ms, decoder_time_ms) if return_timing=True
         """
         if self.use_onnx_decoder:
-            return self._inference_onnx(input_mel_spec, debug=debug)
+            return self._inference_onnx(input_mel_spec, debug=debug, return_timing=return_timing)
         else:
-            return self._inference_hef(input_mel_spec, debug=debug)
+            return self._inference_hef(input_mel_spec, debug=debug, return_timing=return_timing)
 
 
 
@@ -627,15 +639,18 @@ class HailoWhisperPipeline:
 
         return transcription, total_decoder_time
 
-    def _inference_hef(self, input_mel_spec, debug=False):
+    def _inference_hef(self, input_mel_spec, debug=False, return_timing=False):
         """Run full HEF inference (encoder + decoder)."""
         encoded_features, encoder_time_ms = self._run_encoder_hef(input_mel_spec, debug=debug)
         transcription, decoder_time_ms = self._run_decoder_hef(encoded_features, debug=debug)
 
         print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
+
+        if return_timing:
+            return transcription, encoder_time_ms, decoder_time_ms
         return transcription
     
-    def _inference_onnx(self, input_mel_spec, debug=False):
+    def _inference_onnx(self, input_mel_spec, debug=False, return_timing=False):
         """
         Inference using ONNX decoder with KV-cache (hybrid mode: Hailo encoder + ONNX decoder).
         """
@@ -644,6 +659,8 @@ class HailoWhisperPipeline:
 
         print(f"\n[TIMING] Total (Encoder + Decoder): {encoder_time_ms + decoder_time_ms:.1f}ms")
 
+        if return_timing:
+            return transcription, encoder_time_ms, decoder_time_ms
         return transcription
 
 
@@ -657,8 +674,14 @@ def main():
                         help="Path to encoder HEF file")
     parser.add_argument("--decoder_hef_file", type=str, default=None,
                         help="Path to decoder HEF file (not used if --decoder_onnx_dir is provided)")
-    parser.add_argument("--audio_file", type=str, required=True,
+
+    # Mutually exclusive group for audio input
+    audio_group = parser.add_mutually_exclusive_group(required=True)
+    audio_group.add_argument("--audio_file", type=str,
                         help="Path to audio file to transcribe")
+    audio_group.add_argument("--audio_folder", type=str,
+                        help="Path to folder containing <uid>.wav and <uid>.txt files for evaluation")
+
     parser.add_argument("--variant", type=str, default="tiny",
                         help="Model variant (e.g., 'tiny', 'base')")
     parser.add_argument("--decoder_assets_path", type=str, default=None,
@@ -672,9 +695,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Check if audio file exists
-    if not os.path.exists(args.audio_file):
+    # Check if audio file/folder exists
+    if args.audio_file and not os.path.exists(args.audio_file):
         raise ValueError(f"Error: Audio file not found: {args.audio_file}")
+    if args.audio_folder and not os.path.exists(args.audio_folder):
+        raise ValueError(f"Error: Audio folder not found: {args.audio_folder}")
 
     # Validate decoder arguments
     if args.decoder_onnx_dir is None and args.decoder_hef_file is None:
@@ -690,7 +715,10 @@ def main():
         print(f"  Decoder: HEF")
         print(f"  Decoder HEF: {args.decoder_hef_file}")
     print(f"  Variant: {args.variant}")
-    print(f"  Audio file: {args.audio_file}")
+    if args.audio_file:
+        print(f"  Audio file: {args.audio_file}")
+    else:
+        print(f"  Audio folder: {args.audio_folder}")
     print()
 
     # Initialize the pipeline
@@ -706,27 +734,106 @@ def main():
     print("Pipeline initialized successfully!")
     print()
 
-    # Preprocess the audio file
-    print("Preprocessing audio...")
-    preprocess_start = time.time()
-    mel_spectrogram = get_mel_spectrogram(args.audio_file)
-    preprocess_time_ms = (time.time() - preprocess_start) * 1000
-    print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
-    print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
-    print()
+    # Mode 1: Single audio file
+    if args.audio_file:
+        # Preprocess the audio file
+        print("Preprocessing audio...")
+        preprocess_start = time.time()
+        mel_spectrogram = get_mel_spectrogram(args.audio_file)
+        preprocess_time_ms = (time.time() - preprocess_start) * 1000
+        print(f"  Mel spectrogram shape: {mel_spectrogram.shape}")
+        print(f"[TIMING] Preprocessing: {preprocess_time_ms:.1f}ms")
+        print()
 
-    # Run inference
-    print("Running inference...")
-    t1 = time.time()
-    transcription = pipeline.get_transcript(mel_spectrogram, debug=args.debug)
-    total_time_ms = (time.time() - t1) * 1000
-    print(f"[TIMING] Total get_transcript() time: {total_time_ms:.1f}ms")
+        # Run inference
+        print("Running inference...")
+        t1 = time.time()
+        transcription = pipeline.get_transcript(mel_spectrogram, debug=args.debug)
+        total_time_ms = (time.time() - t1) * 1000
+        print(f"[TIMING] Total get_transcript() time: {total_time_ms:.1f}ms")
 
+        # Print result
+        print("=" * 30 + " TRANSCRIPTION:")
+        print(f"{transcription}")
+        print("=" * 30)
 
-    # Print result
-    print("=" * 30 + " TRANSCRIPTION:")
-    print(f"{transcription}")
-    print("=" * 30)
+    # Mode 2: Audio folder with evaluation
+    else:
+        print("Loading dataset...")
+        dataset = load_audio_dataset(args.audio_folder)
+        print()
+
+        print(f"{'='*70}")
+        print(f"Running Evaluation on {len(dataset)} samples")
+        print(f"{'='*70}\n")
+
+        results = []
+        total_wer = 0.0
+        total_cer = 0.0
+        total_encoder_time = 0.0
+        total_decoder_time = 0.0
+
+        for idx, (audio_file, ground_truth) in enumerate(dataset.items(), 1):
+            print(f"[{idx}/{len(dataset)}] Processing: {Path(audio_file).name}")
+
+            try:
+                # Preprocess audio
+                mel_spectrogram = get_mel_spectrogram(audio_file)
+
+                # Run inference with timing
+                transcription, encoder_time_ms, decoder_time_ms = pipeline.get_transcript(
+                    mel_spectrogram, debug=args.debug, return_timing=True
+                )
+
+                # Calculate WER/CER
+                wer_score, cer_score = calculate_wer(transcription, ground_truth)
+
+                total_wer += wer_score
+                total_cer += cer_score
+                total_encoder_time += encoder_time_ms
+                total_decoder_time += decoder_time_ms
+
+                results.append({
+                    'audio_file': audio_file,
+                    'ground_truth': ground_truth,
+                    'transcription': transcription,
+                    'wer': wer_score,
+                    'cer': cer_score,
+                    'encoder_time_ms': encoder_time_ms,
+                    'decoder_time_ms': decoder_time_ms
+                })
+
+                print(f"  GT:   {ground_truth}")
+                print(f"  Pred: {transcription}")
+                print(f"  WER:  {wer_score:.2f}%")
+                print()
+
+            except Exception as e:
+                print(f"  Error: {e}\n")
+                continue
+
+        # Print evaluation summary
+        num_successful = len(results)
+        if num_successful > 0:
+            avg_wer = total_wer / num_successful
+            avg_cer = total_cer / num_successful
+            avg_encoder_time = total_encoder_time / num_successful
+            avg_decoder_time = total_decoder_time / num_successful
+            avg_total_time = avg_encoder_time + avg_decoder_time
+
+            print(f"\n{'='*70}")
+            print("EVALUATION SUMMARY")
+            print(f"{'='*70}")
+            print(f"  Samples processed:     {num_successful}/{len(dataset)}")
+            print(f"  Average WER:           {avg_wer:.2f}%")
+            print(f"  Average CER:           {avg_cer:.2f}%")
+            print(f"\n  Timing:")
+            print(f"    Avg Encoder time:    {avg_encoder_time:.1f}ms")
+            print(f"    Avg Decoder time:    {avg_decoder_time:.1f}ms")
+            print(f"    Avg Total time:      {avg_total_time:.1f}ms")
+            print(f"{'='*70}")
+        else:
+            print("\nNo samples were successfully processed.")
 
 
 if __name__ == "__main__":
