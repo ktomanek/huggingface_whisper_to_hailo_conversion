@@ -5,3 +5,6 @@ onnxruntime
 faster_whisper
 transformers
 jiwer
+psutil
+pyaudio
+silero_vad
